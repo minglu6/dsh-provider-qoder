@@ -16,6 +16,8 @@ try {
     bundle: true,
     platform: 'node',
     format: 'esm',
+    // Downlevel `using` — Node's ESM loader rejects it as `Unexpected identifier`.
+    target: 'node20',
     outfile: tmpfile,
     external: [
       '@deepseek-ai/cordis',
