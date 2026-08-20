@@ -1,0 +1,8 @@
+# Optional Qoder CN adapter. Install with:
+#   dsh plugin --profile web add github:minglu6/dsh-provider-qoder
+# Remove with:
+#   dsh plugin --profile web remove dsh-provider-qoder
+
+- insert:
+    - id: llm-qoder
+      name: dsh-provider-qoder
