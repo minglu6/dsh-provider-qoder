@@ -17,6 +17,7 @@
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -30,6 +31,10 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-settings-plugins"]
     }
   },
   "peerDependencies": {
