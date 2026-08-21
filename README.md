@@ -34,6 +34,10 @@ pnpm dsh web
 
 The plugin registers the `llm-qoder` settings namespace. Connection facts resolve per request. Leave gateway and OpenAPI URLs empty for public cloud.
 
+Unless `models` is configured, the adapter fetches Qoder's signed live catalog from `/algo/api/v2/model/list` whenever DSH lists the provider. Newly released wire keys such as `gmodel` therefore appear without a plugin update; known wire keys retain stable selector ids such as `gm51model` → `glm-5.2`. Exact-model resolution reuses the latest successful catalog in the current process.
+
+`models` remains an optional complete static override for deployments that intentionally pin the selector catalog. It replaces live discovery rather than extending it. Authentication, transport, invalid JSON, and empty-catalog failures surface as discovery errors instead of falling back to an obsolete built-in list.
+
 ## License
 
 MIT

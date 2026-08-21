@@ -115,6 +115,9 @@ function qoderCnEndpoints(vpcInstance) {
 function qoderChatUrl(endpoints) {
   return `${endpoints.gateway}/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 }
+function qoderModelListUrl(endpoints) {
+  return `${endpoints.gateway}/algo/api/v2/model/list`;
+}
 function getQoderCNDirectModel(modelID) {
   return {
     "qoder-cn": "auto",
@@ -130,6 +133,28 @@ function getQoderCNDirectModel(modelID) {
     "minimax-m2.7": "mmodel",
     "minimax-m3": "mmodel"
   }[modelID || ""] || modelID || "auto";
+}
+var qoderCNFriendlyModels = {
+  auto: { id: "auto", name: "Auto" },
+  "qoder-cn": { id: "qoder-cn", name: "Auto" },
+  qmodel_latest: { id: "qwen3.7-max", name: "Qwen 3.7 Max" },
+  qmodel: { id: "qwen3.7-plus", name: "Qwen 3.7 Plus" },
+  q36fmodel: { id: "qwen3.6-flash", name: "Qwen 3.6 Flash" },
+  qfmodel: { id: "qwen3.6-flash", name: "Qwen 3.6 Flash" },
+  dmodel: { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+  dfmodel: { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+  gm51model: { id: "glm-5.2", name: "GLM 5.2" },
+  kmodel: { id: "kimi-k2.6", name: "Kimi K2.6" },
+  mmodel: { id: "minimax-m2.7", name: "MiniMax M2.7" }
+};
+function prettifyQoderCNModelName(name2) {
+  return (name2 || "Model").replace(/\s*·\s*Qoder CN\s*$/i, "").replace(/Qwen(\d)/g, "Qwen $1").replace(/Qwen([\d.]+)-/g, "Qwen $1 ").replace(/DeepSeek\s*V(\d)-/g, "DeepSeek V$1 ").replace(/\s+/g, " ").trim();
+}
+function getQoderCNFriendlyModelInfo(key, display) {
+  return qoderCNFriendlyModels[key] ?? {
+    id: key,
+    name: prettifyQoderCNModelName(display ?? key)
+  };
 }
 function rsaEncryptBase64(data) {
   const encrypted = crypto.publicEncrypt(
@@ -275,7 +300,7 @@ function parseExpiry(data) {
   }
   return Date.now() + 24 * 60 * 60 * 1e3;
 }
-async function exchangeJobToken(pat, endpoints) {
+async function exchangeJobToken(pat, endpoints, signal) {
   const res = await fetch(`${endpoints.openapi}/api/v1/jobToken/exchange`, {
     method: "POST",
     headers: {
@@ -285,7 +310,8 @@ async function exchangeJobToken(pat, endpoints) {
       "Cosy-Version": "1.0.1",
       "Cosy-ClientType": "5"
     },
-    body: JSON.stringify({ personal_token: pat })
+    body: JSON.stringify({ personal_token: pat }),
+    signal
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -301,7 +327,7 @@ async function exchangeJobToken(pat, endpoints) {
     expiresAt: parseExpiry(data)
   };
 }
-async function refreshJobToken(jobRefreshToken, endpoints) {
+async function refreshJobToken(jobRefreshToken, endpoints, signal) {
   if (jobRefreshToken.trim().length === 0) {
     throw new Error("Qoder CN job token refresh requires a non-empty refresh_token (jrt-...)");
   }
@@ -314,7 +340,8 @@ async function refreshJobToken(jobRefreshToken, endpoints) {
       "Cosy-Version": "1.0.1",
       "Cosy-ClientType": "5"
     },
-    body: JSON.stringify({ refresh_token: jobRefreshToken })
+    body: JSON.stringify({ refresh_token: jobRefreshToken }),
+    signal
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -330,7 +357,7 @@ async function refreshJobToken(jobRefreshToken, endpoints) {
     expiresAt: parseExpiry(data)
   };
 }
-async function fetchUserInfo(jobToken, endpoints) {
+async function fetchUserInfo(jobToken, endpoints, signal) {
   let userID = "";
   let email = "";
   let name2 = "";
@@ -342,7 +369,8 @@ async function fetchUserInfo(jobToken, endpoints) {
         "User-Agent": UA,
         "Cosy-Version": "1.0.1",
         "Cosy-ClientType": "5"
-      }
+      },
+      signal
     });
     if (res.ok) {
       const info = await res.json();
@@ -350,7 +378,8 @@ async function fetchUserInfo(jobToken, endpoints) {
       email = info.email || "";
       name2 = info.name || info.username || "";
     }
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
   }
   return { userID, email, name: name2 };
 }
@@ -749,8 +778,60 @@ var REASONING_EFFORTS = [
 ];
 var jobTokenCache = /* @__PURE__ */ new Map();
 var identityCache = /* @__PURE__ */ new Map();
+var modelCatalogCache = /* @__PURE__ */ new Map();
 function hashCredential(value) {
   return crypto2.createHash("sha256").update(value).digest("hex");
+}
+function recordOf(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : void 0;
+}
+function positiveInteger(value) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : void 0;
+}
+function contextWindowOf(entry) {
+  const contexts = recordOf(entry.context_config);
+  let listed;
+  if (contexts !== void 0) {
+    for (const value of Object.values(contexts)) {
+      const context = recordOf(value);
+      const tokenCount = positiveInteger(context?.token_count);
+      if (tokenCount === void 0) continue;
+      if (context?.is_default === true) return tokenCount;
+      listed = listed === void 0 ? tokenCount : Math.max(listed, tokenCount);
+    }
+  }
+  return positiveInteger(entry.max_input_tokens) ?? listed;
+}
+function parseQoderModelCatalog(value) {
+  const root = recordOf(value);
+  if (!Array.isArray(root?.chat)) {
+    throw new LlmError4('Qoder CN model listing has no "chat" array', "DISCOVERY_FAILED");
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const models = [];
+  for (const value2 of root.chat) {
+    const entry = recordOf(value2);
+    const key = typeof entry?.key === "string" ? entry.key.trim() : "";
+    if (key.length === 0 || entry?.enable !== true) continue;
+    const display = typeof entry.display_name === "string" && entry.display_name.trim().length > 0 ? entry.display_name.trim() : key;
+    const identity = getQoderCNFriendlyModelInfo(key, display);
+    if (seen.has(identity.id)) continue;
+    seen.add(identity.id);
+    const contextWindow = contextWindowOf(entry);
+    const maxTokens = positiveInteger(entry.max_output_tokens);
+    models.push({
+      id: identity.id,
+      name: identity.name,
+      ...contextWindow === void 0 ? {} : { contextWindow },
+      ...maxTokens === void 0 ? {} : { maxTokens },
+      inputModalities: entry.is_vl === true ? ["text", "image"] : ["text"],
+      reasoning: entry.is_reasoning === true || recordOf(entry.thinking_config) !== void 0
+    });
+  }
+  if (models.length === 0) {
+    throw new LlmError4("Qoder CN model listing contains no enabled usable models", "DISCOVERY_FAILED");
+  }
+  return models;
 }
 function httpErrorCode(status, detail) {
   if (status === 401 || status === 403) return "AUTH";
@@ -784,15 +865,17 @@ var QoderAdapter = class extends LlmAdapter {
   providerRetryPolicy(_provider) {
     return this.config.options().retryPolicy;
   }
-  listModels(provider) {
-    return Promise.resolve(this.config.options().models.map((model) => modelInfo(provider, model)));
+  async listModels(provider) {
+    const models = await this.catalogModels(this.config.options(), true);
+    return models.map((model) => modelInfo(provider, model));
   }
-  resolveModel(provider, model, _signal) {
+  async resolveModel(provider, model, signal) {
     const connection = this.config.options();
-    const configured = connection.models.find((entry) => entry.id === model);
+    const models = await this.catalogModels(connection, false, signal);
+    const configured = models.find((entry) => entry.id === model);
     const contextWindow = configured?.contextWindow ?? connection.defaultContextWindow;
     const reasoning = configured?.reasoning === true;
-    return Promise.resolve({
+    return {
       ...configured === void 0 ? { provider, id: model, name: model, inputModalities: ["text"] } : modelInfo(provider, configured),
       context: { contextWindow },
       defaultMaxTokens: configured?.maxTokens ?? connection.maxTokens,
@@ -802,7 +885,80 @@ var QoderAdapter = class extends LlmAdapter {
           defaultEffort: OFF_REASONING_EFFORT
         }
       } : {}
+    };
+  }
+  async catalogModels(connection, refresh, signal) {
+    if (connection.models !== void 0) return connection.models;
+    const rawPat = await this.config.resolveApiKey(connection);
+    const cacheKey = `${connection.endpoints.gateway}\0${hashCredential(rawPat)}`;
+    const cached = modelCatalogCache.get(cacheKey);
+    if (!refresh && cached !== void 0) return cached;
+    const models = await this.fetchModelCatalog(connection, rawPat, signal);
+    modelCatalogCache.set(cacheKey, models);
+    return models;
+  }
+  async fetchModelCatalog(connection, rawPat, signal) {
+    let jobToken;
+    let identity;
+    try {
+      jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal);
+      identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal);
+    } catch (error) {
+      if (signal?.aborted) {
+        throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+      }
+      if (error instanceof LlmError4) throw error;
+      throw new LlmError4("Qoder CN model discovery could not authenticate", "DISCOVERY_FAILED", {
+        cause: error
+      });
+    }
+    const url = qoderModelListUrl(connection.endpoints);
+    const headers = buildQoderAuthHeaders(null, url, {
+      userID: identity.userID,
+      authToken: jobToken,
+      name: identity.name,
+      email: identity.email,
+      machineID: connection.machineId
     });
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          ...headers,
+          ...attributionHeaders()
+        },
+        signal
+      });
+    } catch (error) {
+      if (signal?.aborted) {
+        throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+      }
+      throw new LlmError4(`Could not reach Qoder CN model listing at ${url}`, "DISCOVERY_FAILED", {
+        cause: error
+      });
+    }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new LlmError4(
+        `Qoder CN model listing answered HTTP ${response.status}${detail.length > 0 ? `: ${detail.slice(0, 200)}` : ""}`,
+        "DISCOVERY_FAILED",
+        { status: response.status }
+      );
+    }
+    let value;
+    try {
+      value = await response.json();
+    } catch (error) {
+      if (signal?.aborted) {
+        throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+      }
+      throw new LlmError4("Qoder CN model listing did not answer with JSON", "DISCOVERY_FAILED", {
+        cause: error
+      });
+    }
+    return parseQoderModelCatalog(value);
   }
   async *stream(options) {
     var _stack = [];
@@ -860,8 +1016,8 @@ var QoderAdapter = class extends LlmAdapter {
     }
   }
   async *request(options, signal, connection, rawPat, onComment) {
-    const jobToken = await this.ensureJobToken(rawPat, connection.endpoints);
-    const identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints);
+    const jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal);
+    const identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal);
     const machineId = connection.machineId;
     const qoderModel = getQoderCNDirectModel(options.model);
     const attachments = this.config.resolveAttachments();
@@ -985,7 +1141,7 @@ var QoderAdapter = class extends LlmAdapter {
     yield* translate(mapEnvelopes(envelopes, onComment), reasoningEnabled);
   }
   /** Exchange or refresh the job token for one PAT, caching per process. */
-  async ensureJobToken(rawPat, endpoints) {
+  async ensureJobToken(rawPat, endpoints, signal) {
     const key = hashCredential(rawPat);
     const cached = jobTokenCache.get(key);
     if (cached !== void 0 && cached.expiresAt > Date.now() + 5 * 60 * 1e3) {
@@ -993,14 +1149,15 @@ var QoderAdapter = class extends LlmAdapter {
     }
     if (cached !== void 0 && cached.jobRefreshToken.length > 0) {
       try {
-        const refreshed = await refreshJobToken(cached.jobRefreshToken, endpoints);
+        const refreshed = await refreshJobToken(cached.jobRefreshToken, endpoints, signal);
         jobTokenCache.set(key, refreshed);
         return refreshed.jobToken;
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) throw error;
       }
     }
     try {
-      const exchanged = await exchangeJobToken(rawPat, endpoints);
+      const exchanged = await exchangeJobToken(rawPat, endpoints, signal);
       jobTokenCache.set(key, exchanged);
       return exchanged.jobToken;
     } catch (error) {
@@ -1015,11 +1172,11 @@ var QoderAdapter = class extends LlmAdapter {
     }
   }
   /** Resolve the server identity for one PAT, caching per process. */
-  async ensureIdentity(rawPat, jobToken, endpoints) {
+  async ensureIdentity(rawPat, jobToken, endpoints, signal) {
     const key = hashCredential(rawPat);
     const cached = identityCache.get(key);
     if (cached?.userID) return cached;
-    const info = await fetchUserInfo(jobToken, endpoints);
+    const info = await fetchUserInfo(jobToken, endpoints, signal);
     if (!info.userID) {
       throw new LlmError4(
         "Qoder CN identity unavailable: /userinfo did not return a userID. Check the PAT and VPC routing (QODER_VPC_INSTANCE), then retry.",
@@ -1081,17 +1238,6 @@ var inject = ["llm"];
 var NS = settingsNamespace("llm-qoder");
 var DEFAULT_API_KEY_ENV = "QODERCN_PERSONAL_ACCESS_TOKEN";
 var PROVIDER = "qoder-cn";
-var DEFAULT_MODELS = [
-  { id: "auto", name: "Auto", contextWindow: 18e4, maxTokens: 32768, reasoning: true, inputModalities: ["text", "image"] },
-  { id: "qwen3.7-max", name: "Qwen 3.7 Max", contextWindow: 1e6, maxTokens: 32768, reasoning: true, inputModalities: ["text", "image"] },
-  { id: "qwen3.7-plus", name: "Qwen 3.7 Plus", contextWindow: 1e6, maxTokens: 32768, reasoning: true, inputModalities: ["text"] },
-  { id: "qwen3.6-flash", name: "Qwen 3.6 Flash", contextWindow: 1e6, maxTokens: 32768, reasoning: true, inputModalities: ["text"] },
-  { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", contextWindow: 1e6, maxTokens: 32768, reasoning: true, inputModalities: ["text"] },
-  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", contextWindow: 1e6, maxTokens: 32768, reasoning: true, inputModalities: ["text"] },
-  { id: "glm-5.2", name: "GLM 5.2", contextWindow: 2e5, maxTokens: 32768, reasoning: true, inputModalities: ["text", "image"] },
-  { id: "kimi-k2.6", name: "Kimi K2.6", contextWindow: 256e3, maxTokens: 32768, reasoning: true, inputModalities: ["text", "image"] },
-  { id: "minimax-m2.7", name: "MiniMax M2.7", contextWindow: 2e5, maxTokens: 32768, reasoning: false, inputModalities: ["text"] }
-];
 var catalogModel = z.object({
   id: z.string().required(),
   name: z.string(),
@@ -1108,7 +1254,8 @@ var connectionFields = {
   openApiUrl: z.string(),
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  models: z.array(catalogModel).default(DEFAULT_MODELS),
+  // Schemastery arrays otherwise materialize [], which would disable live discovery.
+  models: z.array(catalogModel).default(void 0),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema
 };
@@ -1126,8 +1273,9 @@ var Config = z.object({
 });
 var PUBLIC_GATEWAY_URL = "https://gateway.qoder.com.cn";
 function resolveModels(models) {
+  if (models === void 0) return void 0;
   const seen = /* @__PURE__ */ new Set();
-  return (models ?? DEFAULT_MODELS).map((model) => {
+  return models.map((model) => {
     if (model.id.length === 0) throw new Error("llm-qoder: catalog model ids must be non-empty");
     if (model.name !== void 0 && model.name.length === 0) {
       throw new Error(`llm-qoder: catalog model "${model.id}" has an empty name`);
@@ -1274,6 +1422,7 @@ export {
   getQoderCNDirectModel,
   inject,
   name,
+  parseQoderModelCatalog,
   qoderCnEndpoints,
   qoderEncodeBody,
   refreshJobToken,

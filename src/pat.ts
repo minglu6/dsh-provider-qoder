@@ -62,10 +62,15 @@ function parseExpiry(data: ExchangeResponse): number {
  * The exchange endpoint requires no COSY signature.
  * @param pat - the `pt-...` personal access token.
  * @param endpoints - resolved CN endpoints.
+ * @param signal - optional caller cancellation.
  * @returns the job-token session.
  * @throws Error when the exchange fails or returns no job token.
  */
-export async function exchangeJobToken(pat: string, endpoints: QoderCnEndpoints): Promise<QoderJobTokenSession> {
+export async function exchangeJobToken(
+  pat: string,
+  endpoints: QoderCnEndpoints,
+  signal?: AbortSignal,
+): Promise<QoderJobTokenSession> {
   const res = await fetch(`${endpoints.openapi}/api/v1/jobToken/exchange`, {
     method: 'POST',
     headers: {
@@ -76,6 +81,7 @@ export async function exchangeJobToken(pat: string, endpoints: QoderCnEndpoints)
       'Cosy-ClientType': '5',
     },
     body: JSON.stringify({ personal_token: pat }),
+    signal,
   })
 
   if (!res.ok) {
@@ -100,10 +106,15 @@ export async function exchangeJobToken(pat: string, endpoints: QoderCnEndpoints)
  * `POST {openapi}/api/v1/jobToken/refresh { refresh_token }`.
  * @param jobRefreshToken - the `jrt-...` refresh token.
  * @param endpoints - resolved CN endpoints.
+ * @param signal - optional caller cancellation.
  * @returns the refreshed job-token session (rotated refresh token persisted).
  * @throws Error when the refresh fails or returns no job token.
  */
-export async function refreshJobToken(jobRefreshToken: string, endpoints: QoderCnEndpoints): Promise<QoderJobTokenSession> {
+export async function refreshJobToken(
+  jobRefreshToken: string,
+  endpoints: QoderCnEndpoints,
+  signal?: AbortSignal,
+): Promise<QoderJobTokenSession> {
   if (jobRefreshToken.trim().length === 0) {
     throw new Error('Qoder CN job token refresh requires a non-empty refresh_token (jrt-...)')
   }
@@ -118,6 +129,7 @@ export async function refreshJobToken(jobRefreshToken: string, endpoints: QoderC
       'Cosy-ClientType': '5',
     },
     body: JSON.stringify({ refresh_token: jobRefreshToken }),
+    signal,
   })
 
   if (!res.ok) {
@@ -142,9 +154,14 @@ export async function refreshJobToken(jobRefreshToken: string, endpoints: QoderC
  * failed or returned nothing; callers decide whether empty identity is fatal.
  * @param jobToken - the short-lived job token (jt-...).
  * @param endpoints - resolved CN endpoints.
+ * @param signal - optional caller cancellation.
  * @returns the identity, or empty fields on failure.
  */
-export async function fetchUserInfo(jobToken: string, endpoints: QoderCnEndpoints): Promise<QoderUserInfo> {
+export async function fetchUserInfo(
+  jobToken: string,
+  endpoints: QoderCnEndpoints,
+  signal?: AbortSignal,
+): Promise<QoderUserInfo> {
   let userID = ''
   let email = ''
   let name = ''
@@ -157,6 +174,7 @@ export async function fetchUserInfo(jobToken: string, endpoints: QoderCnEndpoint
         'Cosy-Version': '1.0.1',
         'Cosy-ClientType': '5',
       },
+      signal,
     })
     if (res.ok) {
       const info = (await res.json()) as { id?: string; email?: string; name?: string; username?: string }
@@ -164,8 +182,9 @@ export async function fetchUserInfo(jobToken: string, endpoints: QoderCnEndpoint
       email = info.email || ''
       name = info.name || info.username || ''
     }
-  } catch {
-    // Callers decide whether empty identity is fatal.
+  } catch (error: unknown) {
+    if (signal?.aborted) throw error
+    // Callers decide whether an unavailable identity is fatal.
   }
   return { userID, email, name }
 }

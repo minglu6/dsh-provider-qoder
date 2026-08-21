@@ -22,7 +22,15 @@ import type {
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { buildQoderAuthHeaders, getQoderCNDirectModel, qoderChatUrl, type CosyCredentials, type QoderCnEndpoints } from './cosy.ts'
+import {
+  buildQoderAuthHeaders,
+  getQoderCNDirectModel,
+  getQoderCNFriendlyModelInfo,
+  qoderChatUrl,
+  qoderModelListUrl,
+  type CosyCredentials,
+  type QoderCnEndpoints,
+} from './cosy.ts'
 import { qoderEncodeBody } from './qoder-encoding.ts'
 import { exchangeJobToken, fetchUserInfo, refreshJobToken, type QoderJobTokenSession } from './pat.ts'
 import { serializeMessages, transformTools, lastUserText } from './serialize.ts'
@@ -57,8 +65,8 @@ export interface QoderConnectionOptions {
   maxTokens: number
   /** Positive context capacity used when the selected model has no exact value. */
   defaultContextWindow: number
-  /** Advisory models exposed to discovery consumers; requests remain unrestricted. */
-  models: readonly QoderCatalogModel[]
+  /** Explicit static catalog override; absence discovers the live server catalog. */
+  models?: readonly QoderCatalogModel[]
   /** Maximum provider idle time while one stream read is outstanding. */
   streamIdleTimeoutMs: number
   /** Provider-owned model-request retry policy, already resolved. */
@@ -101,9 +109,78 @@ const REASONING_EFFORTS = [
 const jobTokenCache = new Map<string, QoderJobTokenSession>()
 /** Process-local identity cache keyed by PAT hash. */
 const identityCache = new Map<string, { userID: string; email: string; name: string }>()
+/** Latest successful live catalog keyed by gateway origin and PAT hash. */
+const modelCatalogCache = new Map<string, readonly QoderCatalogModel[]>()
 
 function hashCredential(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex')
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+    ? value
+    : undefined
+}
+
+function contextWindowOf(entry: Record<string, unknown>): number | undefined {
+  const contexts = recordOf(entry.context_config)
+  let listed: number | undefined
+  if (contexts !== undefined) {
+    for (const value of Object.values(contexts)) {
+      const context = recordOf(value)
+      const tokenCount = positiveInteger(context?.token_count)
+      if (tokenCount === undefined) continue
+      if (context?.is_default === true) return tokenCount
+      listed = listed === undefined ? tokenCount : Math.max(listed, tokenCount)
+    }
+  }
+  return positiveInteger(entry.max_input_tokens) ?? listed
+}
+
+/**
+ * Validate and translate Qoder's model-list response into DSH catalog entries.
+ * Invalid individual records are ignored; an invalid or empty listing fails.
+ * @param value - parsed JSON from `/algo/api/v2/model/list`.
+ * @returns enabled models in server order with stable friendly ids.
+ */
+export function parseQoderModelCatalog(value: unknown): QoderCatalogModel[] {
+  const root = recordOf(value)
+  if (!Array.isArray(root?.chat)) {
+    throw new LlmError('Qoder CN model listing has no "chat" array', 'DISCOVERY_FAILED')
+  }
+  const seen = new Set<string>()
+  const models: QoderCatalogModel[] = []
+  for (const value of root.chat) {
+    const entry = recordOf(value)
+    const key = typeof entry?.key === 'string' ? entry.key.trim() : ''
+    if (key.length === 0 || entry?.enable !== true) continue
+    const display = typeof entry.display_name === 'string' && entry.display_name.trim().length > 0
+      ? entry.display_name.trim()
+      : key
+    const identity = getQoderCNFriendlyModelInfo(key, display)
+    if (seen.has(identity.id)) continue
+    seen.add(identity.id)
+    const contextWindow = contextWindowOf(entry)
+    const maxTokens = positiveInteger(entry.max_output_tokens)
+    models.push({
+      id: identity.id,
+      name: identity.name,
+      ...(contextWindow === undefined ? {} : { contextWindow }),
+      ...(maxTokens === undefined ? {} : { maxTokens }),
+      inputModalities: entry.is_vl === true ? ['text', 'image'] : ['text'],
+      reasoning: entry.is_reasoning === true || recordOf(entry.thinking_config) !== undefined,
+    })
+  }
+  if (models.length === 0) {
+    throw new LlmError('Qoder CN model listing contains no enabled usable models', 'DISCOVERY_FAILED')
+  }
+  return models
 }
 
 /**
@@ -152,20 +229,22 @@ export class QoderAdapter extends LlmAdapter {
     return this.config.options().retryPolicy
   }
 
-  override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(this.config.options().models.map(model => modelInfo(provider, model)))
+  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const models = await this.catalogModels(this.config.options(), true)
+    return models.map(model => modelInfo(provider, model))
   }
 
-  override resolveModel(
+  override async resolveModel(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
     const connection = this.config.options()
-    const configured = connection.models.find(entry => entry.id === model)
+    const models = await this.catalogModels(connection, false, signal)
+    const configured = models.find(entry => entry.id === model)
     const contextWindow = configured?.contextWindow ?? connection.defaultContextWindow
     const reasoning = configured?.reasoning === true
-    return Promise.resolve({
+    return {
       ...configured === undefined
         ? { provider, id: model, name: model, inputModalities: ['text' as const] }
         : modelInfo(provider, configured),
@@ -179,7 +258,90 @@ export class QoderAdapter extends LlmAdapter {
           },
         }
         : {},
+    }
+  }
+
+  private async catalogModels(
+    connection: QoderConnectionOptions,
+    refresh: boolean,
+    signal?: AbortSignal,
+  ): Promise<readonly QoderCatalogModel[]> {
+    if (connection.models !== undefined) return connection.models
+    const rawPat = await this.config.resolveApiKey(connection)
+    const cacheKey = `${connection.endpoints.gateway}\0${hashCredential(rawPat)}`
+    const cached = modelCatalogCache.get(cacheKey)
+    if (!refresh && cached !== undefined) return cached
+    const models = await this.fetchModelCatalog(connection, rawPat, signal)
+    modelCatalogCache.set(cacheKey, models)
+    return models
+  }
+
+  private async fetchModelCatalog(
+    connection: QoderConnectionOptions,
+    rawPat: string,
+    signal?: AbortSignal,
+  ): Promise<readonly QoderCatalogModel[]> {
+    let jobToken: string
+    let identity: { userID: string; email: string; name: string }
+    try {
+      jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal)
+      identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal)
+    } catch (error: unknown) {
+      if (signal?.aborted) {
+        throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+      }
+      if (error instanceof LlmError) throw error
+      throw new LlmError('Qoder CN model discovery could not authenticate', 'DISCOVERY_FAILED', {
+        cause: error,
+      })
+    }
+    const url = qoderModelListUrl(connection.endpoints)
+    const headers = buildQoderAuthHeaders(null, url, {
+      userID: identity.userID,
+      authToken: jobToken,
+      name: identity.name,
+      email: identity.email,
+      machineID: connection.machineId,
     })
+    let response: Response
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          ...headers,
+          ...attributionHeaders(),
+        },
+        signal,
+      })
+    } catch (error: unknown) {
+      if (signal?.aborted) {
+        throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+      }
+      throw new LlmError(`Could not reach Qoder CN model listing at ${url}`, 'DISCOVERY_FAILED', {
+        cause: error,
+      })
+    }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      throw new LlmError(
+        `Qoder CN model listing answered HTTP ${response.status}${detail.length > 0 ? `: ${detail.slice(0, 200)}` : ''}`,
+        'DISCOVERY_FAILED',
+        { status: response.status },
+      )
+    }
+    let value: unknown
+    try {
+      value = await response.json()
+    } catch (error: unknown) {
+      if (signal?.aborted) {
+        throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+      }
+      throw new LlmError('Qoder CN model listing did not answer with JSON', 'DISCOVERY_FAILED', {
+        cause: error,
+      })
+    }
+    return parseQoderModelCatalog(value)
   }
 
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -240,9 +402,9 @@ export class QoderAdapter extends LlmAdapter {
     onComment: () => void,
   ): AsyncIterable<StreamChunk> {
     // 1. PAT → job token (cached; refreshed through the jrt when expired).
-    const jobToken = await this.ensureJobToken(rawPat, connection.endpoints)
+    const jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal)
     // 2. Identity (userID required by the COSY envelope).
-    const identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints)
+    const identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal)
     const machineId = connection.machineId
 
     // 3. Serialize messages + build the wire body.
@@ -386,6 +548,7 @@ export class QoderAdapter extends LlmAdapter {
   private async ensureJobToken(
     rawPat: string,
     endpoints: QoderCnEndpoints,
+    signal?: AbortSignal,
   ): Promise<string> {
     const key = hashCredential(rawPat)
     const cached = jobTokenCache.get(key)
@@ -394,15 +557,16 @@ export class QoderAdapter extends LlmAdapter {
     }
     if (cached !== undefined && cached.jobRefreshToken.length > 0) {
       try {
-        const refreshed = await refreshJobToken(cached.jobRefreshToken, endpoints)
+        const refreshed = await refreshJobToken(cached.jobRefreshToken, endpoints, signal)
         jobTokenCache.set(key, refreshed)
         return refreshed.jobToken
-      } catch {
+      } catch (error: unknown) {
+        if (signal?.aborted) throw error
         // Fall through to a fresh PAT exchange.
       }
     }
     try {
-      const exchanged = await exchangeJobToken(rawPat, endpoints)
+      const exchanged = await exchangeJobToken(rawPat, endpoints, signal)
       jobTokenCache.set(key, exchanged)
       return exchanged.jobToken
     } catch (error: unknown) {
@@ -426,11 +590,12 @@ export class QoderAdapter extends LlmAdapter {
     rawPat: string,
     jobToken: string,
     endpoints: QoderCnEndpoints,
+    signal?: AbortSignal,
   ): Promise<{ userID: string; email: string; name: string }> {
     const key = hashCredential(rawPat)
     const cached = identityCache.get(key)
     if (cached?.userID) return cached
-    const info = await fetchUserInfo(jobToken, endpoints)
+    const info = await fetchUserInfo(jobToken, endpoints, signal)
     if (!info.userID) {
       throw new LlmError(
         'Qoder CN identity unavailable: /userinfo did not return a userID. Check the PAT and VPC routing (QODER_VPC_INSTANCE), then retry.',

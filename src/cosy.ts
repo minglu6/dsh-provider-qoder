@@ -214,6 +214,20 @@ export function getQoderCNDirectModel(modelID?: string): string {
   )
 }
 
+const qoderCNFriendlyModels: Readonly<Record<string, { id: string; name: string }>> = {
+  auto: { id: 'auto', name: 'Auto' },
+  'qoder-cn': { id: 'qoder-cn', name: 'Auto' },
+  qmodel_latest: { id: 'qwen3.7-max', name: 'Qwen 3.7 Max' },
+  qmodel: { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus' },
+  q36fmodel: { id: 'qwen3.6-flash', name: 'Qwen 3.6 Flash' },
+  qfmodel: { id: 'qwen3.6-flash', name: 'Qwen 3.6 Flash' },
+  dmodel: { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  dfmodel: { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  gm51model: { id: 'glm-5.2', name: 'GLM 5.2' },
+  kmodel: { id: 'kimi-k2.6', name: 'Kimi K2.6' },
+  mmodel: { id: 'minimax-m2.7', name: 'MiniMax M2.7' },
+}
+
 /**
  * Prettify an upstream display name (`Qwen3.7` → `Qwen 3.7`). The provider
  * id already names the route, so model labels do not repeat it.
@@ -228,6 +242,23 @@ export function prettifyQoderCNModelName(name: string): string {
     .replace(/DeepSeek\s*V(\d)-/g, 'DeepSeek V$1 ')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+/**
+ * Translate one server wire key into the stable model id shown by DSH.
+ * Unknown newly released keys remain directly addressable under their wire id.
+ * @param key - Qoder's model key.
+ * @param display - optional upstream display name.
+ * @returns the selector id and label.
+ */
+export function getQoderCNFriendlyModelInfo(
+  key: string,
+  display?: string,
+): { id: string; name: string } {
+  return qoderCNFriendlyModels[key] ?? {
+    id: key,
+    name: prettifyQoderCNModelName(display ?? key),
+  }
 }
 
 function rsaEncryptBase64(data: string): string {

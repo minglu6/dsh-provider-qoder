@@ -32,6 +32,7 @@ export {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  parseQoderModelCatalog,
   QoderAdapter,
 } from './adapter.ts'
 export type { QoderAdapterOptions, QoderCatalogModel, QoderConnectionOptions } from './adapter.ts'
@@ -46,18 +47,6 @@ const NS = settingsNamespace('llm-qoder')
 const DEFAULT_API_KEY_ENV = 'QODERCN_PERSONAL_ACCESS_TOKEN'
 /** The single provider route this plugin owns. */
 const PROVIDER = 'qoder-cn'
-
-const DEFAULT_MODELS: QoderCatalogModel[] = [
-  { id: 'auto', name: 'Auto', contextWindow: 180_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text', 'image'] },
-  { id: 'qwen3.7-max', name: 'Qwen 3.7 Max', contextWindow: 1_000_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text', 'image'] },
-  { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus', contextWindow: 1_000_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text'] },
-  { id: 'qwen3.6-flash', name: 'Qwen 3.6 Flash', contextWindow: 1_000_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text'] },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_000_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text'] },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_000_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text'] },
-  { id: 'glm-5.2', name: 'GLM 5.2', contextWindow: 200_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text', 'image'] },
-  { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 256_000, maxTokens: 32_768, reasoning: true, inputModalities: ['text', 'image'] },
-  { id: 'minimax-m2.7', name: 'MiniMax M2.7', contextWindow: 200_000, maxTokens: 32_768, reasoning: false, inputModalities: ['text'] },
-]
 
 /**
  * Plugin config, validated by the same-named schemastery schema and doubling
@@ -79,7 +68,7 @@ export interface Config {
   maxTokens?: number
   /** Positive context capacity used when the selected model has no exact value (default 1,000,000). */
   defaultContextWindow?: number
-  /** Advisory models shown by discovery consumers; defaults to the Qoder CN catalog. */
+  /** Optional complete static catalog override; absence discovers Qoder's live catalog. */
   models?: QoderCatalogModel[]
   /** Maximum provider idle time while one stream read is outstanding (default five minutes). */
   streamIdleTimeoutMs?: number
@@ -106,7 +95,8 @@ const connectionFields = {
   openApiUrl: z.string(),
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  models: z.array(catalogModel).default(DEFAULT_MODELS),
+  // Schemastery arrays otherwise materialize [], which would disable live discovery.
+  models: z.array(catalogModel).default(undefined as never),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema,
 }
@@ -127,10 +117,13 @@ export const Config: z<Config> = z.object({
 /** Public gateway origin; used when no override and no VPC instance are configured. */
 export const PUBLIC_GATEWAY_URL = 'https://gateway.qoder.com.cn'
 
-/** Resolve, validate, and detach the advisory model catalog. */
-function resolveModels(models: readonly QoderCatalogModel[] | undefined): QoderCatalogModel[] {
+/** Resolve, validate, and detach an optional static model-catalog override. */
+function resolveModels(
+  models: readonly QoderCatalogModel[] | undefined,
+): QoderCatalogModel[] | undefined {
+  if (models === undefined) return undefined
   const seen = new Set<string>()
-  return (models ?? DEFAULT_MODELS).map((model) => {
+  return models.map((model) => {
     if (model.id.length === 0) throw new Error('llm-qoder: catalog model ids must be non-empty')
     if (model.name !== undefined && model.name.length === 0) {
       throw new Error(`llm-qoder: catalog model "${model.id}" has an empty name`)

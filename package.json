@@ -25,7 +25,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dsh": {
     "bundle": {
