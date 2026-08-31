@@ -29,6 +29,7 @@ try {
       '@deepseek-ai/dsh-timeout',
       '@deepseek-ai/dsh-home-paths',
       '@deepseek-ai/dsh-attachment',
+      '@deepseek-ai/dsh-util-values',
     ],
   })
 } catch (err) {

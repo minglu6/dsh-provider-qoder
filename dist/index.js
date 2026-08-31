@@ -49,8 +49,8 @@ import z from "@deepseek-ai/schemastery";
 import { assertUsableApiKey, LlmError as LlmError5, resolveRetryPolicy, RetryPolicySchema } from "@deepseek-ai/dsh-llm";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { launchEnvironmentOf } from "@deepseek-ai/dsh-launch-environment";
-import { deepEqualJson, installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
 import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
+import { deepEqualJson } from "@deepseek-ai/dsh-util-values";
 import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
 
 // src/adapter.ts
@@ -559,7 +559,7 @@ async function* parseQoderSse(stream) {
 }
 
 // src/translate.ts
-import { CallId, EMPTY_RESPONSE_CODE, LlmError as LlmError3 } from "@deepseek-ai/dsh-llm";
+import { EMPTY_RESPONSE_CODE, LlmError as LlmError3, ToolCallId } from "@deepseek-ai/dsh-llm";
 
 // src/thinking-parser.ts
 var THINKING_TAG_VARIANTS = [
@@ -629,7 +629,7 @@ function closeBlock(block) {
     case "tool-call":
       return {
         type: "tool-call",
-        id: CallId(block.callId ?? ""),
+        id: ToolCallId(block.callId ?? ""),
         name: block.name ?? "",
         arguments: block.text
       };
@@ -749,7 +749,7 @@ async function* translate(envelopes, reasoningEnabled = true) {
         yield {
           type: "tool-call-delta",
           index: block.index,
-          id: CallId(block.callId ?? ""),
+          id: ToolCallId(block.callId ?? ""),
           ...block.name !== void 0 ? { name: block.name } : {},
           argumentsDelta: fragment
         };
@@ -1235,7 +1235,7 @@ async function* mapEnvelopes(payloads, onComment) {
 // src/index.ts
 var name = "llm-qoder";
 var inject = ["llm"];
-var NS = settingsNamespace("llm-qoder");
+var NS = "llm-qoder";
 var DEFAULT_API_KEY_ENV = "QODERCN_PERSONAL_ACCESS_TOKEN";
 var PROVIDER = "qoder-cn";
 var catalogModel = z.object({
@@ -1401,11 +1401,13 @@ function apply(ctx, config) {
     registration.replace([PROVIDER]);
     registeredPolicy = policy;
   };
-  installSettingsSection(ctx, NS, Config, config, {
-    setSource: (source) => {
-      current = source;
-    },
-    onChange: ensureRegistrationFacts
+  ctx.inject(["settings"], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, NS, Config, config, {
+      setSource: (source) => {
+        current = source;
+      },
+      onChange: ensureRegistrationFacts
+    });
   });
 }
 export {
