@@ -1,0 +1,106 @@
+.qoder-cn-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-xl);
+  background: var(--dsw-alias-settings-card-fill);
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.qoder-cn-card__header,
+.qoder-cn-card__actions,
+.qoder-cn-card__notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.qoder-cn-card__header h3 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 22px;
+  font-weight: 500;
+}
+
+.qoder-cn-card__header > button {
+  margin-left: auto;
+}
+
+.qoder-cn-card__status,
+.qoder-cn-card__hint {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.qoder-cn-card__form,
+.qoder-cn-card__field {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.qoder-cn-card__field {
+  gap: 6px;
+}
+
+.qoder-cn-card__field input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-settings-card-fill);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+}
+
+.qoder-cn-card__field input:focus-visible,
+.qoder-cn-card__advanced summary:focus-visible {
+  outline: 2px solid var(--dsw-alias-button-primary-fill);
+  outline-offset: 2px;
+}
+
+.qoder-cn-card__field input:disabled {
+  cursor: not-allowed;
+}
+
+.qoder-cn-card__advanced summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.qoder-cn-card__advanced[open] summary {
+  margin-bottom: 12px;
+}
+
+.qoder-cn-card__feedback {
+  min-height: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qoder-cn-card__error,
+.qoder-cn-card__notice {
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.qoder-cn-card__actions {
+  justify-content: flex-end;
+}

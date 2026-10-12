@@ -621,6 +621,7 @@ function stableChatRecordID(model: string, options: GenerateOptions): string {
   for (const msg of options.messages) {
     hash.update('\0')
     hash.update(msg.role)
+    if (msg.role === 'tool') hash.update(msg.toolCallId)
     for (const block of msg.content) {
       hash.update('\0')
       hash.update(block.type)
@@ -628,9 +629,6 @@ function stableChatRecordID(model: string, options: GenerateOptions): string {
       if (block.type === 'tool-call') {
         hash.update(block.name)
         hash.update(block.arguments)
-      }
-      if (block.type === 'tool-result') {
-        hash.update(block.toolCallId)
       }
     }
   }

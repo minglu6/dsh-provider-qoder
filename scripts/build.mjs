@@ -44,3 +44,35 @@ try {
   copyFileSync(tmpfile, outfile)
   unlinkSync(tmpfile)
 }
+
+const clientOutfile = join(root, 'dist', 'client.js')
+const clientTmpfile = join(root, 'dist', 'client.js.tmp')
+rmSync(clientTmpfile, { force: true })
+try {
+  buildSync({
+    entryPoints: [join(root, 'src', 'client', 'index.ts')],
+    bundle: true,
+    platform: 'browser',
+    format: 'cjs',
+    target: 'es2022',
+    jsx: 'automatic',
+    outfile: clientTmpfile,
+    loader: { '.css': 'text' },
+    external: ['react', 'react/jsx-runtime', '@deepseek-ai/*'],
+    define: { 'process.env.NODE_ENV': '"production"' },
+    banner: {
+      js: 'window.__ModuleLoader__.load({ id: "dsh-provider-qoder", factory: (require) => { var module = { exports: {} }; var exports = module.exports;',
+    },
+    footer: { js: 'return module.exports; } });' },
+  })
+} catch (err) {
+  console.error(err)
+  rmSync(clientTmpfile, { force: true })
+  process.exit(1)
+}
+try {
+  renameSync(clientTmpfile, clientOutfile)
+} catch {
+  copyFileSync(clientTmpfile, clientOutfile)
+  unlinkSync(clientTmpfile)
+}

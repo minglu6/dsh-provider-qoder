@@ -1,0 +1,68 @@
+/** Bilingual copy for the plugin-owned connection editor. */
+/** English credential-card copy and translation key source. */
+export const en = {
+  title: 'Qoder CN',
+  intro: 'Connect with a personal access token. Leave the VPC instance empty to use the public service.',
+  configured: 'PAT configured',
+  missing: 'PAT not configured',
+  unknown: 'PAT status unavailable',
+  edit: 'Edit connection',
+  cancel: 'Cancel',
+  close: 'Close',
+  save: 'Save',
+  saving: 'Saving…',
+  pat: 'Personal access token (PAT)',
+  patHint: 'Leave empty to keep the existing token. Stored tokens are never displayed.',
+  vpc: 'VPC instance (optional)',
+  vpcHint: 'Enter the instance ID, not a workspace URL. Clear it to use the public service.',
+  advanced: 'Advanced endpoint overrides',
+  gateway: 'Gateway URL (optional)',
+  openApi: 'OpenAPI URL (optional)',
+  endpointHint: 'Leave empty to derive the endpoints from the VPC instance or public service.',
+  readOnly: 'Connection settings are read-only in this session. Open the local Host to edit them.',
+  credentialReadOnly: 'This token is managed by a read-only credential source, such as the launch environment. Update it there instead.',
+  loadFailed: 'Could not read the token status. Retry before saving a new token.',
+  credentialFailed: 'The token could not be saved. Your input is kept; retry or check the credential source.',
+  settingsFailed: 'The connection could not be saved. Your input is kept; check the values and retry.',
+  conflict: 'These settings changed elsewhere. Cancel and reopen this editor to load the latest values; your draft has not been discarded.',
+  partial: 'Connection settings were saved, but the token was not. Closing will not undo the saved settings.',
+  unavailable: 'Qoder connection settings are unavailable. Enable the llm-qoder plugin entry on the Host.',
+  retry: 'Retry',
+  public: 'Public service',
+} as const
+
+/** Translation keys accepted by this card. */
+export type CopyKey = keyof typeof en
+/** Localized text lookup supplied by the slot's locale binding. */
+export type Translate = (key: CopyKey) => string
+/** Chinese credential-card copy. */
+export const zh: Record<CopyKey, string> = {
+  title: 'Qoder CN',
+  intro: '使用个人访问令牌连接。VPC 实例留空时使用公网服务',
+  configured: 'PAT 已配置',
+  missing: 'PAT 未配置',
+  unknown: 'PAT 状态不可用',
+  edit: '编辑连接',
+  cancel: '取消',
+  close: '关闭',
+  save: '保存',
+  saving: '正在保存…',
+  pat: '个人访问令牌（PAT）',
+  patHint: '留空保留现有令牌，已保存的令牌不会回显',
+  vpc: 'VPC 实例（可选）',
+  vpcHint: '填写实例 ID，而不是工作区网址；清空后使用公网服务',
+  advanced: '高级端点覆盖',
+  gateway: 'Gateway URL（可选）',
+  openApi: 'OpenAPI URL（可选）',
+  endpointHint: '留空时根据 VPC 实例或公网服务自动生成端点',
+  readOnly: '当前会话的连接设置为只读，请在本机 Host 中编辑',
+  credentialReadOnly: '此令牌由启动环境等只读凭据来源管理，请到对应来源中修改',
+  loadFailed: '无法读取令牌状态，请重试后再保存新令牌',
+  credentialFailed: '令牌保存失败，输入已保留；请重试或检查凭据来源',
+  settingsFailed: '连接保存失败，输入已保留；请检查填写内容后重试',
+  conflict: '这些设置已在其他地方修改。请取消并重新打开编辑器以加载最新值，当前草稿尚未丢弃',
+  partial: '连接设置已保存，但令牌未保存；关闭编辑器不会撤销已保存的设置',
+  unavailable: 'Qoder 连接设置不可用，请在 Host 上启用 llm-qoder 插件条目',
+  retry: '重试',
+  public: '公网服务',
+}

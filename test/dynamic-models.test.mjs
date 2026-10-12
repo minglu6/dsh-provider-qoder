@@ -49,8 +49,8 @@ test('keeps an omitted catalog absent after Schemastery resolves defaults', () =
       },
     },
   })
-  assert.equal(resolved.models, undefined)
-  assert.equal(resolved.providers['qoder-cn'].models, undefined)
+  assert.equal(resolved.models.get(), undefined)
+  assert.equal(resolved.providers.get()['qoder-cn'].models, undefined)
 })
 
 test('parses enabled live models and rejects unusable listings', () => {

@@ -389,13 +389,6 @@ import { contentHasImage, LlmError } from "@deepseek-ai/dsh-llm";
 function getBlocksText(blocks) {
   return blocks.filter((block) => block.type === "text").map((block) => block.text).join("");
 }
-function flattenBlocksText(blocks) {
-  return blocks.map((block) => {
-    if (block.type === "text") return block.text;
-    if (block.type === "tool-result") return flattenBlocksText(block.content);
-    return "";
-  }).join("");
-}
 function transformTools(options) {
   return options.tools !== void 0 && options.tools.length > 0 ? options.tools.map((tool) => ({
     type: "function",
@@ -407,7 +400,7 @@ function transformTools(options) {
   })) : void 0;
 }
 async function userContent(blocks, attachments) {
-  if (!contentHasImage(blocks)) return flattenBlocksText(blocks);
+  if (!contentHasImage(blocks)) return getBlocksText(blocks);
   const content = [];
   for (const block of blocks) {
     switch (block.type) {
@@ -430,12 +423,6 @@ async function userContent(blocks, attachments) {
         });
         break;
       }
-      case "tool-result": {
-        const nested = await userContent(block.content, attachments);
-        if (typeof nested !== "string") content.push(...nested);
-        else content.push({ type: "text", text: nested });
-        break;
-      }
       default:
         break;
     }
@@ -446,20 +433,16 @@ async function serializeMessages(options, attachments) {
   const normalizedMessages = [];
   for (const msg of options.messages) {
     if (msg.role === "user") {
-      const regular = msg.content.filter((block) => block.type !== "tool-result");
-      const content = await userContent(regular, attachments);
-      const results = msg.content.filter((block) => block.type === "tool-result");
-      if (content !== "" || results.length === 0) {
-        normalizedMessages.push({ role: "user", content });
-      }
-      for (const result of results) {
-        const resultContent = await userContent(result.content, attachments);
-        normalizedMessages.push({
-          role: "tool",
-          tool_call_id: result.toolCallId,
-          content: typeof resultContent === "string" ? resultContent || "(no output)" : resultContent
-        });
-      }
+      normalizedMessages.push({ role: "user", content: await userContent(msg.content, attachments) });
+      continue;
+    }
+    if (msg.role === "tool") {
+      const content = await userContent(msg.content, attachments);
+      normalizedMessages.push({
+        role: "tool",
+        tool_call_id: msg.toolCallId,
+        content: typeof content === "string" ? content || "(no output)" : content
+      });
       continue;
     }
     if (msg.role === "assistant") {
@@ -500,7 +483,7 @@ function lastUserText(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg !== void 0 && msg.role === "user") {
-      return getBlocksText(msg.content.filter((block) => block.type !== "tool-result"));
+      return getBlocksText(msg.content);
     }
   }
   return "";
@@ -1200,6 +1183,7 @@ function stableChatRecordID(model, options) {
   for (const msg of options.messages) {
     hash.update("\0");
     hash.update(msg.role);
+    if (msg.role === "tool") hash.update(msg.toolCallId);
     for (const block of msg.content) {
       hash.update("\0");
       hash.update(block.type);
@@ -1207,9 +1191,6 @@ function stableChatRecordID(model, options) {
       if (block.type === "tool-call") {
         hash.update(block.name);
         hash.update(block.arguments);
-      }
-      if (block.type === "tool-result") {
-        hash.update(block.toolCallId);
       }
     }
   }
@@ -1248,29 +1229,51 @@ var catalogModel = z.object({
   reasoning: z.boolean()
 });
 var connectionFields = {
-  apiKeyEnv: z.string().role("credential-ref").default(DEFAULT_API_KEY_ENV),
-  vpcInstance: z.string(),
+  apiKeyEnv: z.string().role("credential-ref").pattern(/^[A-Za-z_][A-Za-z0-9_]*$/),
+  vpcInstance: z.string().pattern(/^$|^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/),
   baseURL: z.string(),
   openApiUrl: z.string(),
-  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
-  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
+  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
+  defaultContextWindow: z.number().step(1).min(1),
   // Schemastery arrays otherwise materialize [], which would disable live discovery.
   models: z.array(catalogModel).default(void 0),
-  streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+  streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS),
   retryPolicy: RetryPolicySchema
 };
 var Config = z.object({
-  apiKeyEnv: connectionFields.apiKeyEnv,
-  vpcInstance: connectionFields.vpcInstance,
-  baseURL: connectionFields.baseURL,
-  openApiUrl: connectionFields.openApiUrl,
-  maxTokens: connectionFields.maxTokens,
-  defaultContextWindow: connectionFields.defaultContextWindow,
-  models: connectionFields.models,
-  streamIdleTimeoutMs: connectionFields.streamIdleTimeoutMs,
-  retryPolicy: connectionFields.retryPolicy,
-  providers: z.dict(z.object(connectionFields))
+  apiKeyEnv: connectionFields.apiKeyEnv.volatile(),
+  vpcInstance: connectionFields.vpcInstance.volatile(),
+  baseURL: connectionFields.baseURL.volatile(),
+  openApiUrl: connectionFields.openApiUrl.volatile(),
+  maxTokens: connectionFields.maxTokens.volatile(),
+  defaultContextWindow: connectionFields.defaultContextWindow.volatile(),
+  models: connectionFields.models.volatile(),
+  streamIdleTimeoutMs: connectionFields.streamIdleTimeoutMs.volatile(),
+  retryPolicy: connectionFields.retryPolicy.volatile(),
+  providers: z.dict(z.object(connectionFields)).default({}).volatile()
 });
+function plainOptions(config) {
+  return {
+    apiKeyEnv: config.apiKeyEnv.get(),
+    vpcInstance: config.vpcInstance.get(),
+    baseURL: config.baseURL.get(),
+    openApiUrl: config.openApiUrl.get(),
+    maxTokens: config.maxTokens.get(),
+    defaultContextWindow: config.defaultContextWindow.get(),
+    models: config.models.get(),
+    streamIdleTimeoutMs: config.streamIdleTimeoutMs.get(),
+    retryPolicy: config.retryPolicy.get(),
+    providers: config.providers.get()
+  };
+}
+function endpointOverride(value, field) {
+  if (value === void 0 || value === "") return void 0;
+  const url = new URL(value);
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error(`llm-qoder: ${field} must be an HTTP(S) URL without credentials, query, or fragment`);
+  }
+  return value.replace(/\/+$/, "");
+}
 var PUBLIC_GATEWAY_URL = "https://gateway.qoder.com.cn";
 function resolveModels(models) {
   if (models === void 0) return void 0;
@@ -1304,9 +1307,22 @@ function resolveModels(models) {
   });
 }
 function resolveAdapterOptions(config, environment) {
+  return { ...resolveConnectionOptions(config, environment), machineId: getMachineId(dshHomePath()) };
+}
+function resolveConnectionOptions(config, environment) {
   const profile = config.providers?.[PROVIDER];
   if (profile !== void 0) {
-    config = { ...config, ...profile };
+    config = {
+      apiKeyEnv: profile.apiKeyEnv ?? config.apiKeyEnv,
+      vpcInstance: profile.vpcInstance ?? config.vpcInstance,
+      baseURL: profile.baseURL ?? config.baseURL,
+      openApiUrl: profile.openApiUrl ?? config.openApiUrl,
+      maxTokens: profile.maxTokens ?? config.maxTokens,
+      defaultContextWindow: profile.defaultContextWindow ?? config.defaultContextWindow,
+      models: profile.models ?? config.models,
+      streamIdleTimeoutMs: profile.streamIdleTimeoutMs ?? config.streamIdleTimeoutMs,
+      retryPolicy: profile.retryPolicy ?? config.retryPolicy
+    };
   }
   if (config.defaultContextWindow !== void 0 && (!Number.isInteger(config.defaultContextWindow) || config.defaultContextWindow <= 0)) {
     throw new Error("llm-qoder: defaultContextWindow must be a positive integer");
@@ -1322,10 +1338,13 @@ function resolveAdapterOptions(config, environment) {
   }
   const get = (name2) => environment?.get(name2);
   const vpcInstance = config.vpcInstance ?? parseVpcInstanceFromEnvironment(get);
+  if (vpcInstance !== void 0 && vpcInstance !== "" && !/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(vpcInstance)) {
+    throw new Error("llm-qoder: vpcInstance must be a tenant instance name");
+  }
   const endpoints = qoderCnEndpoints(vpcInstance);
   const finalEndpoints = {
-    gateway: config.baseURL?.replace(/\/+$/, "") ?? endpoints.gateway,
-    openapi: config.openApiUrl?.replace(/\/+$/, "") ?? endpoints.openapi,
+    gateway: endpointOverride(config.baseURL, "baseURL") ?? endpoints.gateway,
+    openapi: endpointOverride(config.openApiUrl, "openApiUrl") ?? endpoints.openapi,
     manage: endpoints.manage
   };
   return {
@@ -1335,31 +1354,26 @@ function resolveAdapterOptions(config, environment) {
     defaultContextWindow: config.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
     models: resolveModels(config.models),
     streamIdleTimeoutMs,
-    retryPolicy: resolveRetryPolicy(config.retryPolicy, "llm-qoder: retryPolicy"),
-    machineId: getMachineId(dshHomePath())
+    retryPolicy: resolveRetryPolicy(config.retryPolicy, "llm-qoder: retryPolicy")
   };
 }
 function apply(ctx, config) {
-  let current = () => config;
-  let lastRaw;
-  let lastGood;
-  const options = () => {
-    const raw = current();
-    if (raw === lastRaw && lastGood !== void 0) return lastGood;
-    try {
-      const next = resolveAdapterOptions(raw, launchEnvironmentOf(ctx));
-      lastRaw = raw;
-      lastGood = next;
-      return next;
-    } catch (error) {
-      if (lastGood === void 0) throw error;
-      lastRaw = raw;
-      ctx.logger.error("llm-qoder: keeping the last good configuration after an invalid settings section");
-      ctx.logger.error(error);
-      return lastGood;
+  ctx.inject(["settings"], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber));
+  });
+  const settingsNs = ctx.fiber.entry?.options.id ?? NS;
+  const environment = launchEnvironmentOf(ctx);
+  const initial = resolveConnectionOptions(plainOptions(config), environment);
+  const machineId = getMachineId(dshHomePath());
+  let current = { ...initial, machineId };
+  const options = () => current;
+  ctx.on("internal/config", function(_raw, next) {
+    const raw = next();
+    if (this === ctx.fiber) {
+      resolveConnectionOptions(plainOptions(Config(raw)), environment);
     }
-  };
-  options();
+    return raw;
+  });
   const resolveApiKey = async (connection) => {
     const ref = connection.apiKeyEnv;
     const credentials = ctx.get("credentials");
@@ -1391,23 +1405,16 @@ function apply(ctx, config) {
     resolveAttachments: () => ctx.get("attachments")
   });
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: PROVIDER, settingsNs: NS, settingsPath: ["providers", PROVIDER] }
+    { provider: PROVIDER, displayName: PROVIDER, settingsNs, settingsPath: ["providers", PROVIDER] }
   ]);
   const registration = ctx.llm.registerAdapter([PROVIDER], adapter);
   let registeredPolicy = options().retryPolicy;
-  const ensureRegistrationFacts = () => {
-    const policy = options().retryPolicy;
+  ctx.on("loader/volatile-update", () => {
+    current = { ...resolveConnectionOptions(plainOptions(config), environment), machineId };
+    const policy = current.retryPolicy;
     if (deepEqualJson(policy, registeredPolicy)) return;
     registration.replace([PROVIDER]);
     registeredPolicy = policy;
-  };
-  ctx.inject(["settings"], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => {
-        current = source;
-      },
-      onChange: ensureRegistrationFacts
-    });
   });
 }
 export {
