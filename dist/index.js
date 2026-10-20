@@ -543,39 +543,73 @@ import { EMPTY_RESPONSE_CODE, LlmError as LlmError3, ToolCallId } from "@deepsee
 // src/thinking-parser.ts
 var THINKING_TAG_VARIANTS = [
   { open: "<thinking>", close: "</thinking>" },
-  { open: " thinking", close: " response" },
+  { open: "<think>", close: "</think>" },
   { open: "<reasoning>", close: "</reasoning>" },
   { open: "<thought>", close: "</thought>" }
 ];
-function splitThinking(chunk) {
-  const pieces = [];
-  let cursor = 0;
-  let currentKind = "text";
-  let current = [];
-  const flush = (kind) => {
-    const text = current.join("");
-    if (text.length > 0) pieces.push({ kind, text });
-    current = [];
-  };
-  while (cursor < chunk.length) {
-    let matched = false;
-    for (const variant of THINKING_TAG_VARIANTS) {
-      const open = currentKind === "text" ? variant.open : variant.close;
-      if (chunk.startsWith(open, cursor)) {
-        flush(currentKind);
-        currentKind = currentKind === "text" ? "reasoning" : "text";
-        cursor += open.length;
-        matched = true;
+var ThinkingParser = class {
+  pending = "";
+  closingTag;
+  sawThinking = false;
+  get hasThinking() {
+    return this.sawThinking;
+  }
+  get hasUnclosedThinking() {
+    return this.closingTag !== void 0;
+  }
+  feed(chunk) {
+    const input = this.pending + chunk;
+    this.pending = "";
+    const pieces = [];
+    const emit = (text) => {
+      if (text.length === 0) return;
+      const kind = this.closingTag === void 0 ? "text" : "reasoning";
+      const last = pieces[pieces.length - 1];
+      if (last?.kind === kind) last.text += text;
+      else pieces.push({ kind, text });
+    };
+    let cursor = 0;
+    while (cursor < input.length) {
+      const tagStart = input.indexOf("<", cursor);
+      if (tagStart === -1) {
+        emit(input.slice(cursor));
         break;
       }
+      emit(input.slice(cursor, tagStart));
+      if (this.closingTag !== void 0) {
+        if (input.startsWith(this.closingTag, tagStart)) {
+          cursor = tagStart + this.closingTag.length;
+          this.closingTag = void 0;
+          continue;
+        }
+      } else {
+        const variant = THINKING_TAG_VARIANTS.find((tag) => input.startsWith(tag.open, tagStart));
+        if (variant) {
+          this.closingTag = variant.close;
+          this.sawThinking = true;
+          cursor = tagStart + variant.open.length;
+          continue;
+        }
+      }
+      const suffix = input.slice(tagStart);
+      const isPrefix = this.closingTag !== void 0 ? this.closingTag.startsWith(suffix) : THINKING_TAG_VARIANTS.some((tag) => tag.open.startsWith(suffix));
+      if (isPrefix) {
+        this.pending = suffix;
+        break;
+      }
+      emit("<");
+      cursor = tagStart + 1;
     }
-    if (matched) continue;
-    current.push(chunk.charAt(cursor));
-    cursor++;
+    return pieces;
   }
-  flush(currentKind);
-  return pieces;
-}
+  /** A stream-tail prefix is literal content, not a complete protocol tag. */
+  flush() {
+    if (this.pending.length === 0) return [];
+    const text = this.pending;
+    this.pending = "";
+    return [{ kind: this.closingTag === void 0 ? "text" : "reasoning", text }];
+  }
+};
 
 // src/translate.ts
 function mapFinishReason(reason) {
@@ -633,7 +667,7 @@ function upstreamErrorDetail(detail) {
   }
   return detail.slice(0, 2e3);
 }
-async function* translate(envelopes, reasoningEnabled = true) {
+async function* translate(envelopes) {
   let nextIndex = 0;
   let textBlock;
   let reasoningBlock;
@@ -641,6 +675,28 @@ async function* translate(envelopes, reasoningEnabled = true) {
   const order = [];
   let pendingFinish;
   let pendingUsage;
+  const thinkingParser = new ThinkingParser();
+  let hasVisibleText = false;
+  function* emitPieces(pieces) {
+    for (const piece of pieces) {
+      if (piece.kind === "reasoning") {
+        if (!reasoningBlock) {
+          reasoningBlock = open("reasoning");
+          yield { type: "block-start", index: reasoningBlock.index, blockType: "reasoning" };
+        }
+        reasoningBlock.text += piece.text;
+        yield { type: "reasoning-delta", index: reasoningBlock.index, text: piece.text };
+      } else {
+        if (!hasVisibleText && piece.text.trim().length > 0) hasVisibleText = true;
+        if (!textBlock) {
+          textBlock = open("text");
+          yield { type: "block-start", index: textBlock.index, blockType: "text" };
+        }
+        textBlock.text += piece.text;
+        yield { type: "text-delta", index: textBlock.index, text: piece.text };
+      }
+    }
+  }
   const open = (kind) => {
     const block = { index: nextIndex++, kind, text: "" };
     order.push(block);
@@ -648,18 +704,29 @@ async function* translate(envelopes, reasoningEnabled = true) {
   };
   for await (const item of envelopes) {
     if (item === DONE) {
+      yield* emitPieces(thinkingParser.flush());
       for (const block of order) {
         yield { type: "block-end", index: block.index, block: closeBlock(block) };
       }
       if (pendingUsage) yield { type: "usage", usage: pendingUsage };
-      const reason = pendingFinish ?? { kind: "stop" };
-      yield {
-        type: "finish",
-        reason: reason.kind === "stop" && order.length === 0 ? {
+      let reason = pendingFinish ?? { kind: "stop" };
+      const hasTools = toolBlocks.size > 0;
+      const hasThinking = thinkingParser.hasThinking || reasoningBlock !== void 0;
+      if (reason.kind === "tool-calls" && !hasTools || reason.kind === "stop" && !hasTools && (thinkingParser.hasUnclosedThinking || hasThinking && !hasVisibleText)) {
+        reason = {
+          kind: "error",
+          failure: {
+            message: "Qoder returned an incomplete response without a final answer or structured tool call",
+            code: "QODER_INCOMPLETE_RESPONSE"
+          }
+        };
+      } else if (reason.kind === "stop" && order.length === 0) {
+        reason = {
           kind: "error",
           failure: { message: "model returned a completed response with no content", code: EMPTY_RESPONSE_CODE }
-        } : reason
-      };
+        };
+      }
+      yield { type: "finish", reason };
       return;
     }
     let envelope;
@@ -701,33 +768,7 @@ async function* translate(envelopes, reasoningEnabled = true) {
       }
       const content = delta?.content;
       if (typeof content === "string" && content.length > 0) {
-        if (reasoningEnabled) {
-          const pieces = splitThinking(content);
-          for (const piece of pieces) {
-            if (piece.kind === "reasoning") {
-              if (!reasoningBlock) {
-                reasoningBlock = open("reasoning");
-                yield { type: "block-start", index: reasoningBlock.index, blockType: "reasoning" };
-              }
-              reasoningBlock.text += piece.text;
-              yield { type: "reasoning-delta", index: reasoningBlock.index, text: piece.text };
-            } else {
-              if (!textBlock) {
-                textBlock = open("text");
-                yield { type: "block-start", index: textBlock.index, blockType: "text" };
-              }
-              textBlock.text += piece.text;
-              yield { type: "text-delta", index: textBlock.index, text: piece.text };
-            }
-          }
-        } else {
-          if (!textBlock) {
-            textBlock = open("text");
-            yield { type: "block-start", index: textBlock.index, blockType: "text" };
-          }
-          textBlock.text += content;
-          yield { type: "text-delta", index: textBlock.index, text: content };
-        }
+        yield* emitPieces(thinkingParser.feed(content));
       }
       for (const call of delta?.tool_calls ?? []) {
         const index = call.index ?? 0;
@@ -1162,7 +1203,7 @@ var QoderAdapter = class extends LlmAdapter {
       const envelopes = parseQoderSse(response.body);
       let emitted = false;
       try {
-        for await (const chunk of translate(mapEnvelopes(envelopes, onComment), reasoningEnabled)) {
+        for await (const chunk of translate(mapEnvelopes(envelopes, onComment))) {
           emitted = true;
           yield chunk;
         }

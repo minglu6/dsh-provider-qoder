@@ -592,7 +592,7 @@ export class QoderAdapter extends LlmAdapter {
       // only when nothing has been emitted yet.
       let emitted = false
       try {
-        for await (const chunk of translate(mapEnvelopes(envelopes, onComment), reasoningEnabled)) {
+        for await (const chunk of translate(mapEnvelopes(envelopes, onComment))) {
           emitted = true
           yield chunk
         }

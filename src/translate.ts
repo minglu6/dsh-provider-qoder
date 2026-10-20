@@ -1,8 +1,8 @@
 /**
  * Translate Qoder CN inner chunk objects into the harness `StreamChunk`
  * protocol. Reasoning arrives either as `delta.reasoning_content` (native) or
- * embedded in `delta.content` as ` thinking`-style HTML tags (fallback
- * parser). Tool-call arguments are raw JSON strings end-to-end; block indexes
+ * embedded in `delta.content` as HTML-style thinking tags (fallback parser).
+ * Tool-call arguments are raw JSON strings end-to-end; block indexes
  * follow first-seen stream order. Usage and finish are deferred until the
  * `[DONE]` sentinel so nothing follows `finish`.
  *
@@ -13,7 +13,7 @@ import { EMPTY_RESPONSE_CODE, LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { DONE, type QoderEnvelope } from './sse.ts'
 import { httpErrorCode } from './errors.ts'
-import { splitThinking } from './thinking-parser.ts'
+import { ThinkingParser, type ThinkingPiece } from './thinking-parser.ts'
 
 /** Inner chunk shape carried inside the SSE envelope body. */
 export interface QoderInnerChunk {
@@ -121,12 +121,10 @@ function upstreamErrorDetail(detail: string): string {
  * StreamChunks. Reasoning, text, and tool-call deltas flow as they arrive;
  * block-ends, usage, and finish are deferred to the sentinel.
  * @param envelopes - decoded SSE envelopes, `[DONE]`-terminated.
- * @param reasoningEnabled - whether thinking is on (enables the tag fallback).
  * @returns the harness chunk stream.
  */
 export async function* translate(
   envelopes: AsyncIterable<QoderEnvelope | string>,
-  reasoningEnabled = true,
 ): AsyncGenerator<StreamChunk> {
   let nextIndex = 0
   let textBlock: OpenBlock | undefined
@@ -135,6 +133,29 @@ export async function* translate(
   const order: OpenBlock[] = []
   let pendingFinish: FinishReason | undefined
   let pendingUsage: TokenUsage | undefined
+  const thinkingParser = new ThinkingParser()
+  let hasVisibleText = false
+
+  function* emitPieces(pieces: ThinkingPiece[]): Generator<StreamChunk> {
+    for (const piece of pieces) {
+      if (piece.kind === 'reasoning') {
+        if (!reasoningBlock) {
+          reasoningBlock = open('reasoning')
+          yield { type: 'block-start', index: reasoningBlock.index, blockType: 'reasoning' }
+        }
+        reasoningBlock.text += piece.text
+        yield { type: 'reasoning-delta', index: reasoningBlock.index, text: piece.text }
+      } else {
+        if (!hasVisibleText && piece.text.trim().length > 0) hasVisibleText = true
+        if (!textBlock) {
+          textBlock = open('text')
+          yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+        }
+        textBlock.text += piece.text
+        yield { type: 'text-delta', index: textBlock.index, text: piece.text }
+      }
+    }
+  }
 
   const open = (kind: OpenBlock['kind']): OpenBlock => {
     const block: OpenBlock = { index: nextIndex++, kind, text: '' }
@@ -144,20 +165,35 @@ export async function* translate(
 
   for await (const item of envelopes) {
     if (item === DONE) {
+      yield* emitPieces(thinkingParser.flush())
       for (const block of order) {
         yield { type: 'block-end', index: block.index, block: closeBlock(block) }
       }
       if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
-      const reason = pendingFinish ?? { kind: 'stop' as const }
-      yield {
-        type: 'finish',
-        reason: reason.kind === 'stop' && order.length === 0
-          ? {
-            kind: 'error',
-            failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
-          }
-          : reason,
+      let reason = pendingFinish ?? { kind: 'stop' as const }
+      const hasTools = toolBlocks.size > 0
+      const hasThinking = thinkingParser.hasThinking || reasoningBlock !== undefined
+      if (
+        (reason.kind === 'tool-calls' && !hasTools)
+        || (reason.kind === 'stop' && !hasTools && (
+          thinkingParser.hasUnclosedThinking
+          || (hasThinking && !hasVisibleText)
+        ))
+      ) {
+        reason = {
+          kind: 'error',
+          failure: {
+            message: 'Qoder returned an incomplete response without a final answer or structured tool call',
+            code: 'QODER_INCOMPLETE_RESPONSE',
+          },
+        }
+      } else if (reason.kind === 'stop' && order.length === 0) {
+        reason = {
+          kind: 'error',
+          failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+        }
       }
+      yield { type: 'finish', reason }
       return
     }
 
@@ -209,33 +245,7 @@ export async function* translate(
 
       const content = delta?.content
       if (typeof content === 'string' && content.length > 0) {
-        if (reasoningEnabled) {
-          const pieces = splitThinking(content)
-          for (const piece of pieces) {
-            if (piece.kind === 'reasoning') {
-              if (!reasoningBlock) {
-                reasoningBlock = open('reasoning')
-                yield { type: 'block-start', index: reasoningBlock.index, blockType: 'reasoning' }
-              }
-              reasoningBlock.text += piece.text
-              yield { type: 'reasoning-delta', index: reasoningBlock.index, text: piece.text }
-            } else {
-              if (!textBlock) {
-                textBlock = open('text')
-                yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
-              }
-              textBlock.text += piece.text
-              yield { type: 'text-delta', index: textBlock.index, text: piece.text }
-            }
-          }
-        } else {
-          if (!textBlock) {
-            textBlock = open('text')
-            yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
-          }
-          textBlock.text += content
-          yield { type: 'text-delta', index: textBlock.index, text: content }
-        }
+        yield* emitPieces(thinkingParser.feed(content))
       }
 
       for (const call of delta?.tool_calls ?? []) {

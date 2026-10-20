@@ -62,6 +62,12 @@ Qoder can reject tool results when the preceding assistant message contains only
 
 In-band upstream errors expose the nested provider message and gateway request ID rather than truncating the JSON wrapper before the actionable detail. Error classification and authentication retry behavior are unchanged.
 
+### Streaming reasoning and incomplete responses
+
+The adapter incrementally recognizes `<thinking>`, `<think>`, `<reasoning>`, and `<thought>` across stream boundaries, even if upstream emits them with reasoning disabled. Ordinary text, whitespace, native reasoning, and structured tool calls are preserved.
+
+A normal stop containing only reasoning, or unclosed tagged reasoning without a structured tool call, finishes with `QODER_INCOMPLETE_RESPONSE` rather than reporting success. Partial reasoning remains available as evidence; orphan DSML fragments are not converted into invented tool calls. Real tool calls and length-limit termination retain their normal behavior. This guard does not retry requests or replay tools.
+
 ## Development
 
 ```sh

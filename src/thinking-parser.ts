@@ -1,61 +1,91 @@
 /**
- * Fallback reasoning extraction: when the Qoder gateway folds thinking into
- * the visible text channel as HTML-style tags (` thinking` / ` response`,
- * `<thinking>` / `</thinking>`, …), this module splits each content chunk into
- * reasoning and visible-text pieces. The native `delta.reasoning_content`
- * channel is preferred; this only runs when that channel is absent.
+ * Incrementally extract tagged reasoning from the visible content channel.
+ * Native reasoning is handled separately by the stream translator.
  *
  * @module dsh-llm-qoder/thinking-parser
  */
 
-const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
+const THINKING_TAG_VARIANTS = [
   { open: '<thinking>', close: '</thinking>' },
-  { open: ' thinking', close: ' response' },
+  { open: '<think>', close: '</think>' },
   { open: '<reasoning>', close: '</reasoning>' },
   { open: '<thought>', close: '</thought>' },
 ]
 
-/** One split piece of a content chunk. */
+/** One ordered reasoning or visible-text fragment. */
 export interface ThinkingPiece {
   kind: 'reasoning' | 'text'
   text: string
 }
 
-/**
- * Split one content chunk into reasoning and text pieces. The fallback works
- * on whole chunks; streaming boundaries are handled by the caller keeping
- * piece text until a closing tag arrives.
- * @param chunk - one visible-content delta.
- * @returns alternating text/reasoning pieces in order.
- */
-export function splitThinking(chunk: string): ThinkingPiece[] {
-  const pieces: ThinkingPiece[] = []
-  let cursor = 0
-  let currentKind: 'reasoning' | 'text' = 'text'
-  let current: string[] = []
+/** Retain only a possible tag prefix between chunks, never an entire response. */
+export class ThinkingParser {
+  private pending = ''
+  private closingTag: string | undefined
+  private sawThinking = false
 
-  const flush = (kind: ThinkingPiece['kind']): void => {
-    const text = current.join('')
-    if (text.length > 0) pieces.push({ kind, text })
-    current = []
+  get hasThinking(): boolean {
+    return this.sawThinking
   }
 
-  while (cursor < chunk.length) {
-    let matched = false
-    for (const variant of THINKING_TAG_VARIANTS) {
-      const open = currentKind === 'text' ? variant.open : variant.close
-      if (chunk.startsWith(open, cursor)) {
-        flush(currentKind)
-        currentKind = currentKind === 'text' ? 'reasoning' : 'text'
-        cursor += open.length
-        matched = true
+  get hasUnclosedThinking(): boolean {
+    return this.closingTag !== undefined
+  }
+
+  feed(chunk: string): ThinkingPiece[] {
+    const input = this.pending + chunk
+    this.pending = ''
+    const pieces: ThinkingPiece[] = []
+    const emit = (text: string): void => {
+      if (text.length === 0) return
+      const kind = this.closingTag === undefined ? 'text' : 'reasoning'
+      const last = pieces[pieces.length - 1]
+      if (last?.kind === kind) last.text += text
+      else pieces.push({ kind, text })
+    }
+
+    let cursor = 0
+    while (cursor < input.length) {
+      const tagStart = input.indexOf('<', cursor)
+      if (tagStart === -1) {
+        emit(input.slice(cursor))
         break
       }
+      emit(input.slice(cursor, tagStart))
+      if (this.closingTag !== undefined) {
+        if (input.startsWith(this.closingTag, tagStart)) {
+          cursor = tagStart + this.closingTag.length
+          this.closingTag = undefined
+          continue
+        }
+      } else {
+        const variant = THINKING_TAG_VARIANTS.find(tag => input.startsWith(tag.open, tagStart))
+        if (variant) {
+          this.closingTag = variant.close
+          this.sawThinking = true
+          cursor = tagStart + variant.open.length
+          continue
+        }
+      }
+      const suffix = input.slice(tagStart)
+      const isPrefix = this.closingTag !== undefined
+        ? this.closingTag.startsWith(suffix)
+        : THINKING_TAG_VARIANTS.some(tag => tag.open.startsWith(suffix))
+      if (isPrefix) {
+        this.pending = suffix
+        break
+      }
+      emit('<')
+      cursor = tagStart + 1
     }
-    if (matched) continue
-    current.push(chunk.charAt(cursor))
-    cursor++
+    return pieces
   }
-  flush(currentKind)
-  return pieces
+
+  /** A stream-tail prefix is literal content, not a complete protocol tag. */
+  flush(): ThinkingPiece[] {
+    if (this.pending.length === 0) return []
+    const text = this.pending
+    this.pending = ''
+    return [{ kind: this.closingTag === undefined ? 'text' : 'reasoning', text }]
+  }
 }
