@@ -151,7 +151,12 @@ export async function serializeMessages(
           toolCalls.push(call)
         }
       }
-      const mapped: QoderMessage = { role: 'assistant', content: content || null }
+      // Qoder rejects tool results after an assistant with null content.
+      // Keep a non-empty marker on the wire only; never alter stored history.
+      const mapped: QoderMessage = {
+        role: 'assistant',
+        content: content || (toolCalls.length > 0 ? '(tool call)' : null),
+      }
       if (toolCalls.length > 0) {
         mapped.tool_calls = toolCalls
       }

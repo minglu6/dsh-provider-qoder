@@ -3,14 +3,18 @@
  * agent_chat_generation endpoint, emitting harness StreamChunks. The adapter
  * is transport + auth only: endpoint facts arrive through a thunk resolved
  * once per operation, the PAT through a per-request resolver, and the job
- * token / identity through process-local caches keyed by the PAT, so the
- * registering plugin owns validation, layering, and credential policy.
+ * token / identity through process-local caches keyed by the endpoint set and
+ * PAT, so the registering plugin owns validation, layering, and credential
+ * policy. When the gateway signals an expired job token (HTTP 401/403 or an
+ * in-band `code 105` envelope), the cached session is dropped and the request
+ * is retried once after a fresh exchange; sessions are also rotated by age
+ * because the advertised 24h TTL has proven optimistic.
  *
  * @module dsh-llm-qoder/adapter
  */
 
 import crypto from 'node:crypto'
-import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, isQuotaExceededError, LlmAdapter, LlmError, QUOTA_EXCEEDED_CODE, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { attributionHeaders, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -24,13 +28,13 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import {
   buildQoderAuthHeaders,
-  getQoderCNDirectModel,
-  getQoderCNFriendlyModelInfo,
   qoderChatUrl,
   qoderModelListUrl,
   type CosyCredentials,
   type QoderCnEndpoints,
 } from './cosy.ts'
+import { httpErrorCode, isAuthExpiredStatus } from './errors.ts'
+export { httpErrorCode } from './errors.ts'
 import { qoderEncodeBody } from './qoder-encoding.ts'
 import { exchangeJobToken, fetchUserInfo, refreshJobToken, type QoderJobTokenSession } from './pat.ts'
 import { serializeMessages, transformTools, lastUserText } from './serialize.ts'
@@ -39,7 +43,7 @@ import { translate } from './translate.ts'
 
 /** One catalog model entry advertised by the adapter. */
 export interface QoderCatalogModel {
-  /** Deployment-facing model id (e.g. `deepseek-v4-pro`). */
+  /** Exact upstream wire key used for model selection and generation (e.g. `dmodel`). */
   id: string
   /** Selector label; defaults to {@link id}. */
   name?: string
@@ -105,15 +109,46 @@ const REASONING_EFFORTS = [
   { id: MAX_REASONING_EFFORT, name: 'Max' },
 ] as const
 
-/** Process-local job-token cache keyed by PAT hash, so one exchange per PAT per process. */
+/** Process-local job-token cache keyed by endpoint set + PAT hash, so one exchange per PAT per endpoint set per process. */
 const jobTokenCache = new Map<string, QoderJobTokenSession>()
-/** Process-local identity cache keyed by PAT hash. */
+/** Process-local identity cache keyed by endpoint set + PAT hash. */
 const identityCache = new Map<string, { userID: string; email: string; name: string }>()
 /** Latest successful live catalog keyed by gateway origin and PAT hash. */
 const modelCatalogCache = new Map<string, readonly QoderCatalogModel[]>()
 
 function hashCredential(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex')
+}
+
+/**
+ * Conservative rotation window: the server advertises a 24h job-token TTL
+ * but the gateway has been observed rejecting tokens after roughly two
+ * hours, so sessions rotate by age well before the advertised expiry.
+ */
+const JOB_TOKEN_MAX_AGE_MS = 30 * 60 * 1000
+/** Safety margin ahead of the advertised expiry before proactive rotation. */
+const JOB_TOKEN_EXPIRY_SLACK_MS = 5 * 60 * 1000
+
+/** Cache key shared by the job-token and identity caches. */
+function sessionCacheKey(endpoints: QoderCnEndpoints, rawPat: string): string {
+  return `${endpoints.gateway}\0${endpoints.openapi}\0${hashCredential(rawPat)}`
+}
+
+/** Drop the cached job-token session (auth-expired or poisoned). */
+function invalidateJobToken(endpoints: QoderCnEndpoints, rawPat: string): void {
+  jobTokenCache.delete(sessionCacheKey(endpoints, rawPat))
+}
+
+/** Whether an error marks the job-token session as rejected by the gateway. */
+function isAuthExpiredError(error: unknown): boolean {
+  return error instanceof LlmError
+    && (error.code === 'AUTH' || isAuthExpiredStatus(error.failure.status))
+}
+
+/** Whether a cached session is still trusted: unexpired and not too old. */
+function jobTokenUsable(session: QoderJobTokenSession): boolean {
+  return session.expiresAt > Date.now() + JOB_TOKEN_EXPIRY_SLACK_MS
+    && session.issuedAt + JOB_TOKEN_MAX_AGE_MS > Date.now()
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -147,7 +182,7 @@ function contextWindowOf(entry: Record<string, unknown>): number | undefined {
  * Validate and translate Qoder's model-list response into DSH catalog entries.
  * Invalid individual records are ignored; an invalid or empty listing fails.
  * @param value - parsed JSON from `/algo/api/v2/model/list`.
- * @returns enabled models in server order with stable friendly ids.
+ * @returns enabled models in server order, preserving upstream keys and display names.
  */
 export function parseQoderModelCatalog(value: unknown): QoderCatalogModel[] {
   const root = recordOf(value)
@@ -163,14 +198,13 @@ export function parseQoderModelCatalog(value: unknown): QoderCatalogModel[] {
     const display = typeof entry.display_name === 'string' && entry.display_name.trim().length > 0
       ? entry.display_name.trim()
       : key
-    const identity = getQoderCNFriendlyModelInfo(key, display)
-    if (seen.has(identity.id)) continue
-    seen.add(identity.id)
+    if (seen.has(key)) continue
+    seen.add(key)
     const contextWindow = contextWindowOf(entry)
     const maxTokens = positiveInteger(entry.max_output_tokens)
     models.push({
-      id: identity.id,
-      name: identity.name,
+      id: key,
+      name: display,
       ...(contextWindow === undefined ? {} : { contextWindow }),
       ...(maxTokens === undefined ? {} : { maxTokens }),
       inputModalities: entry.is_vl === true ? ['text', 'image'] : ['text'],
@@ -181,24 +215,6 @@ export function parseQoderModelCatalog(value: unknown): QoderCatalogModel[] {
     throw new LlmError('Qoder CN model listing contains no enabled usable models', 'DISCOVERY_FAILED')
   }
   return models
-}
-
-/**
- * Map an HTTP status to a stable LlmError code.
- * @param status - status of a non-2xx provider response.
- * @param detail - provider error body text, when available.
- * @returns the normalized harness error code.
- */
-export function httpErrorCode(status: number, detail: string): string {
-  if (status === 401 || status === 403) return 'AUTH'
-  if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE
-  if (status === 429) return 'RATE_LIMIT'
-  if (status === 400) {
-    if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
-    return 'INVALID_REQUEST'
-  }
-  if (status >= 500) return 'SERVER'
-  return `HTTP_${status}`
 }
 
 function modelInfo(provider: string, model: QoderCatalogModel): LlmModelInfo {
@@ -281,67 +297,79 @@ export class QoderAdapter extends LlmAdapter {
     rawPat: string,
     signal?: AbortSignal,
   ): Promise<readonly QoderCatalogModel[]> {
-    let jobToken: string
-    let identity: { userID: string; email: string; name: string }
-    try {
-      jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal)
-      identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal)
-    } catch (error: unknown) {
-      if (signal?.aborted) {
-        throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
-      }
-      if (error instanceof LlmError) throw error
-      throw new LlmError('Qoder CN model discovery could not authenticate', 'DISCOVERY_FAILED', {
-        cause: error,
-      })
-    }
     const url = qoderModelListUrl(connection.endpoints)
-    const headers = buildQoderAuthHeaders(null, url, {
-      userID: identity.userID,
-      authToken: jobToken,
-      name: identity.name,
-      email: identity.email,
-      machineID: connection.machineId,
-    })
-    let response: Response
-    try {
-      response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          ...headers,
-          ...attributionHeaders(),
-        },
-        signal,
-      })
-    } catch (error: unknown) {
-      if (signal?.aborted) {
-        throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+    // The cached job token may be rejected by the gateway (code 105); drop it
+    // and retry exactly once with a fresh exchange before failing discovery.
+    for (let attempt = 0; ; attempt++) {
+      let jobToken: string
+      let identity: { userID: string; email: string; name: string }
+      try {
+        jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal)
+        identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal)
+      } catch (error: unknown) {
+        if (signal?.aborted) {
+          throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+        }
+        if (attempt === 0 && isAuthExpiredError(error)) {
+          invalidateJobToken(connection.endpoints, rawPat)
+          continue
+        }
+        if (error instanceof LlmError) throw error
+        throw new LlmError('Qoder CN model discovery could not authenticate', 'DISCOVERY_FAILED', {
+          cause: error,
+        })
       }
-      throw new LlmError(`Could not reach Qoder CN model listing at ${url}`, 'DISCOVERY_FAILED', {
-        cause: error,
+      const headers = buildQoderAuthHeaders(null, url, {
+        userID: identity.userID,
+        authToken: jobToken,
+        name: identity.name,
+        email: identity.email,
+        machineID: connection.machineId,
       })
-    }
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '')
-      throw new LlmError(
-        `Qoder CN model listing answered HTTP ${response.status}${detail.length > 0 ? `: ${detail.slice(0, 200)}` : ''}`,
-        'DISCOVERY_FAILED',
-        { status: response.status },
-      )
-    }
-    let value: unknown
-    try {
-      value = await response.json()
-    } catch (error: unknown) {
-      if (signal?.aborted) {
-        throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+      let response: Response
+      try {
+        response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            ...headers,
+            ...attributionHeaders(),
+          },
+          signal,
+        })
+      } catch (error: unknown) {
+        if (signal?.aborted) {
+          throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+        }
+        throw new LlmError(`Could not reach Qoder CN model listing at ${url}`, 'DISCOVERY_FAILED', {
+          cause: error,
+        })
       }
-      throw new LlmError('Qoder CN model listing did not answer with JSON', 'DISCOVERY_FAILED', {
-        cause: error,
-      })
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '')
+        if (attempt === 0 && isAuthExpiredStatus(response.status)) {
+          invalidateJobToken(connection.endpoints, rawPat)
+          continue
+        }
+        throw new LlmError(
+          `Qoder CN model listing answered HTTP ${response.status}${detail.length > 0 ? `: ${detail.slice(0, 200)}` : ''}`,
+          httpErrorCode(response.status, detail),
+          { status: response.status },
+        )
+      }
+      let value: unknown
+      try {
+        value = await response.json()
+      } catch (error: unknown) {
+        if (signal?.aborted) {
+          throw new LlmError('Qoder CN model discovery aborted by caller', 'ABORTED', { cause: error })
+        }
+        throw new LlmError('Qoder CN model listing did not answer with JSON', 'DISCOVERY_FAILED', {
+          cause: error,
+        })
+      }
+      return parseQoderModelCatalog(value)
     }
-    return parseQoderModelCatalog(value)
   }
 
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -401,158 +429,198 @@ export class QoderAdapter extends LlmAdapter {
     rawPat: string,
     onComment: () => void,
   ): AsyncIterable<StreamChunk> {
-    // 1. PAT → job token (cached; refreshed through the jrt when expired).
-    const jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal)
-    // 2. Identity (userID required by the COSY envelope).
-    const identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal)
-    const machineId = connection.machineId
-
-    // 3. Serialize messages + build the wire body.
-    const qoderModel = getQoderCNDirectModel(options.model)
+    // Loop-invariant request facts: model, serialized messages, record id.
+    const qoderModel = options.model
     const attachments = this.config.resolveAttachments()
     const messages = await serializeMessages(options, attachments)
     const tools = transformTools(options)
     const system = options.system ?? ''
     const originalContent = lastUserText(options.messages)
-
-    const requestId = crypto.randomUUID()
-    const sessionID = crypto
-      .createHash('sha256')
-      .update(`qoder-session\0${identity.userID}\0${qoderModel}`)
-      .digest('hex').slice(0, 16)
     const recordID = stableChatRecordID(qoderModel, options)
     const maxTokens = options.maxTokens ?? connection.maxTokens
     const reasoningEnabled = options.reasoningEffort !== undefined && options.reasoningEffort !== 'off'
-
-    const reqBody: Record<string, unknown> = {
-      request_id: requestId,
-      request_set_id: recordID,
-      chat_record_id: recordID,
-      session_id: sessionID,
-      stream: true,
-      chat_task: 'FREE_INPUT',
-      is_reply: true,
-      is_retry: false,
-      source: 1,
-      version: '3',
-      session_type: 'qodercli',
-      agent_id: 'agent_common',
-      task_id: 'common',
-      code_language: '',
-      chat_prompt: '',
-      image_urls: null,
-      aliyun_user_type: '',
-      system,
-      messages,
-      tools: tools ?? [],
-      parameters: {
-        max_tokens: maxTokens,
-        ...reasoningEnabled ? { reasoning_effort: options.reasoningEffort } : {},
-      },
-      chat_context: {
-        chatPrompt: '',
-        imageUrls: null,
-        extra: {
-          context: [],
-          modelConfig: {
-            key: qoderModel,
-            is_reasoning: reasoningEnabled,
-          },
-          originalContent,
-        },
-        features: [],
-        text: originalContent,
-      },
-      model_config: {
-        key: qoderModel,
-        is_reasoning: reasoningEnabled,
-        max_output_tokens: maxTokens,
-        source: 'system',
-      },
-      business: {
-        product: 'cli',
-        version: '1.0.0',
-        type: 'agent',
-        stage: 'start',
-        id: crypto.randomUUID(),
-        name: originalContent.substring(0, 30),
-        begin_at: Date.now(),
-      },
-    }
-
-    // 4. WAF-encode + COSY-sign.
-    const bodyBytes = Buffer.from(JSON.stringify(reqBody))
-    const encodedBody = qoderEncodeBody(bodyBytes)
-    const encodedBytes = Buffer.from(encodedBody, 'utf8')
     const chatURL = qoderChatUrl(connection.endpoints)
-    const cosyCreds: CosyCredentials = {
-      userID: identity.userID,
-      authToken: jobToken,
-      name: identity.name,
-      email: identity.email,
-      machineID: machineId,
-    }
-    const headers = buildQoderAuthHeaders(encodedBytes, chatURL, cosyCreds)
 
-    // 5. POST and stream.
-    let response: Response
-    try {
-      response = await fetch(chatURL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Accept-Encoding': 'identity',
-          'X-Model-Key': qoderModel,
-          'X-Model-Source': 'system',
-          ...headers,
-          ...attributionHeaders(),
-        },
-        body: encodedBytes,
-        signal,
-      })
-    } catch (error: unknown) {
-      if (signal.aborted) throw error
-      throw new LlmError(
-        `Qoder CN API request to ${chatURL} failed`,
-        'TRANSPORT',
-        { cause: error },
-      )
-    }
-
-    if (!response.ok) {
-      let message = `Qoder CN API error (HTTP ${response.status})`
-      let bodyText = ''
+    // A cached job token can be rejected mid-stream-start (in-band code 105
+    // envelope or HTTP 401/403). Drop the session and retry exactly once
+    // with a fresh exchange — but only before any chunk has been emitted,
+    // since already-yielded output cannot be taken back.
+    for (let attempt = 0; ; attempt++) {
+      // 1. PAT → job token (cached; refreshed/rotated through the jrt).
+      let jobToken: string
+      let identity: { userID: string; email: string; name: string }
       try {
-        bodyText = await response.text()
-        if (bodyText.length > 0) message = bodyText.slice(0, 200)
-      } catch {
-        // Only swallow error-body parsing: the HTTP status still identifies the failure.
+        jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal)
+        identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal)
+      } catch (error: unknown) {
+        if (signal.aborted) throw error
+        if (attempt === 0 && isAuthExpiredError(error)) {
+          invalidateJobToken(connection.endpoints, rawPat)
+          continue
+        }
+        throw error
       }
-      throw new LlmError(message, httpErrorCode(response.status, bodyText), {
-        status: response.status,
-      })
-    }
-    if (!response.body) {
-      throw new LlmError('Qoder CN API returned no response body', 'EMPTY_RESPONSE')
-    }
 
-    const envelopes = parseQoderSse(response.body)
-    // Feed the translator with decoded envelopes; the translator owns the
-    // envelope → chunk mapping and the [DONE] flush.
-    yield* translate(mapEnvelopes(envelopes, onComment), reasoningEnabled)
+      // 2. Build the wire body.
+      const requestId = crypto.randomUUID()
+      const sessionID = crypto
+        .createHash('sha256')
+        .update(`qoder-session\0${identity.userID}\0${qoderModel}`)
+        .digest('hex').slice(0, 16)
+
+      const reqBody: Record<string, unknown> = {
+        request_id: requestId,
+        request_set_id: recordID,
+        chat_record_id: recordID,
+        session_id: sessionID,
+        stream: true,
+        chat_task: 'FREE_INPUT',
+        is_reply: true,
+        is_retry: false,
+        source: 1,
+        version: '3',
+        session_type: 'qodercli',
+        agent_id: 'agent_common',
+        task_id: 'common',
+        code_language: '',
+        chat_prompt: '',
+        image_urls: null,
+        aliyun_user_type: '',
+        system,
+        messages,
+        tools: tools ?? [],
+        parameters: {
+          max_tokens: maxTokens,
+          ...reasoningEnabled ? { reasoning_effort: options.reasoningEffort } : {},
+        },
+        chat_context: {
+          chatPrompt: '',
+          imageUrls: null,
+          extra: {
+            context: [],
+            modelConfig: {
+              key: qoderModel,
+              is_reasoning: reasoningEnabled,
+            },
+            originalContent,
+          },
+          features: [],
+          text: originalContent,
+        },
+        model_config: {
+          key: qoderModel,
+          is_reasoning: reasoningEnabled,
+          max_output_tokens: maxTokens,
+          source: 'system',
+        },
+        business: {
+          product: 'cli',
+          version: '1.0.0',
+          type: 'agent',
+          stage: 'start',
+          id: crypto.randomUUID(),
+          name: originalContent.substring(0, 30),
+          begin_at: Date.now(),
+        },
+      }
+
+      // 3. WAF-encode + COSY-sign.
+      const bodyBytes = Buffer.from(JSON.stringify(reqBody))
+      const encodedBody = qoderEncodeBody(bodyBytes)
+      const encodedBytes = Buffer.from(encodedBody, 'utf8')
+      const cosyCreds: CosyCredentials = {
+        userID: identity.userID,
+        authToken: jobToken,
+        name: identity.name,
+        email: identity.email,
+        machineID: connection.machineId,
+      }
+      const headers = buildQoderAuthHeaders(encodedBytes, chatURL, cosyCreds)
+
+      // 4. POST and stream.
+      let response: Response
+      try {
+        response = await fetch(chatURL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Accept-Encoding': 'identity',
+            'X-Model-Key': qoderModel,
+            'X-Model-Source': 'system',
+            ...headers,
+            ...attributionHeaders(),
+          },
+          body: encodedBytes,
+          signal,
+        })
+      } catch (error: unknown) {
+        if (signal.aborted) throw error
+        throw new LlmError(
+          `Qoder CN API request to ${chatURL} failed`,
+          'TRANSPORT',
+          { cause: error },
+        )
+      }
+
+      if (!response.ok) {
+        let message = `Qoder CN API error (HTTP ${response.status})`
+        let bodyText = ''
+        try {
+          bodyText = await response.text()
+          if (bodyText.length > 0) message = bodyText.slice(0, 200)
+        } catch {
+          // Only swallow error-body parsing: the HTTP status still identifies the failure.
+        }
+        if (attempt === 0 && isAuthExpiredStatus(response.status)) {
+          invalidateJobToken(connection.endpoints, rawPat)
+          continue
+        }
+        throw new LlmError(message, httpErrorCode(response.status, bodyText), {
+          status: response.status,
+        })
+      }
+      if (!response.body) {
+        throw new LlmError('Qoder CN API returned no response body', 'EMPTY_RESPONSE')
+      }
+
+      const envelopes = parseQoderSse(response.body)
+      // Feed the translator with decoded envelopes; the translator owns the
+      // envelope → chunk mapping and the [DONE] flush. Auth-expired in-band
+      // envelopes (code 105) surface as AUTH before the first chunk; retry
+      // only when nothing has been emitted yet.
+      let emitted = false
+      try {
+        for await (const chunk of translate(mapEnvelopes(envelopes, onComment), reasoningEnabled)) {
+          emitted = true
+          yield chunk
+        }
+      } catch (error: unknown) {
+        if (attempt === 0 && !emitted && isAuthExpiredError(error)) {
+          invalidateJobToken(connection.endpoints, rawPat)
+          continue
+        }
+        throw error
+      }
+      return
+    }
   }
 
-  /** Exchange or refresh the job token for one PAT, caching per process. */
+  /**
+   * Exchange or refresh the job token for one PAT + endpoint set, caching per
+   * process. Sessions rotate by age (`JOB_TOKEN_MAX_AGE_MS`) because the
+   * advertised 24h TTL has proven optimistic; the jrt is preferred while the
+   * session is otherwise usable.
+   */
   private async ensureJobToken(
     rawPat: string,
     endpoints: QoderCnEndpoints,
     signal?: AbortSignal,
   ): Promise<string> {
-    const key = hashCredential(rawPat)
+    const key = sessionCacheKey(endpoints, rawPat)
     const cached = jobTokenCache.get(key)
-    if (cached !== undefined && cached.expiresAt > Date.now() + 5 * 60 * 1000) {
+    if (cached !== undefined && jobTokenUsable(cached)) {
       return cached.jobToken
     }
     if (cached !== undefined && cached.jobRefreshToken.length > 0) {
@@ -592,7 +660,7 @@ export class QoderAdapter extends LlmAdapter {
     endpoints: QoderCnEndpoints,
     signal?: AbortSignal,
   ): Promise<{ userID: string; email: string; name: string }> {
-    const key = hashCredential(rawPat)
+    const key = sessionCacheKey(endpoints, rawPat)
     const cached = identityCache.get(key)
     if (cached?.userID) return cached
     const info = await fetchUserInfo(jobToken, endpoints, signal)

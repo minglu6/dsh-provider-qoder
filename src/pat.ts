@@ -5,8 +5,8 @@
  * exchanged for a short-lived job token (`jt-...`) plus a job refresh token
  * (`jrt-...`) mirroring the official qoderclicn flow, and the user identity is
  * resolved from `/userinfo` because every COSY-signed request needs the server
- * userID. The adapter caches the exchange per PAT in process and refreshes the
- * job token through the jrt before it expires — no plaintext PAT is persisted
+ * userID. The adapter caches the exchange per PAT and endpoint set in process
+ * and rotates the job token before it expires — no plaintext PAT is persisted
  * anywhere.
  *
  * @module dsh-llm-qoder/pat
@@ -22,8 +22,10 @@ export interface QoderJobTokenSession {
   jobToken: string
   /** Job refresh token (jrt-...), if the exchange returned one. */
   jobRefreshToken: string
-  /** Epoch ms when the job token expires. */
+  /** Epoch ms when the job token expires (as advertised by the server). */
   expiresAt: number
+  /** Epoch ms when the job token was issued; drives conservative rotation. */
+  issuedAt: number
 }
 
 /** Identity fields resolved from `/userinfo`. */
@@ -54,6 +56,21 @@ function parseExpiry(data: ExchangeResponse): number {
     return Date.now() + data.expires_in
   }
   return Date.now() + 24 * 60 * 60 * 1000
+}
+
+/**
+ * When the server issued the job token. The advertised 24h expiry proved
+ * optimistic (the gateway has been observed rejecting tokens hours early with
+ * 403 `code 105`), so callers also rotate sessions on a conservative age
+ * window derived from this value. A missing or unparsable `created_at` falls
+ * back to "now", which keeps age-based rotation inert for that session.
+ */
+function parseIssuedAt(data: ExchangeResponse): number {
+  if (data.created_at) {
+    const parsed = Date.parse(data.created_at)
+    if (!Number.isNaN(parsed)) return parsed
+  }
+  return Date.now()
 }
 
 /**
@@ -98,6 +115,7 @@ export async function exchangeJobToken(
     jobToken: data.token,
     jobRefreshToken: data.refresh_token || '',
     expiresAt: parseExpiry(data),
+    issuedAt: parseIssuedAt(data),
   }
 }
 
@@ -146,6 +164,7 @@ export async function refreshJobToken(
     jobToken: data.token,
     jobRefreshToken: data.refresh_token || jobRefreshToken,
     expiresAt: parseExpiry(data),
+    issuedAt: parseIssuedAt(data),
   }
 }
 

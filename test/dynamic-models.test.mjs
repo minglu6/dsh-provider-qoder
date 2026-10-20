@@ -71,8 +71,8 @@ test('parses enabled live models and rejects unusable listings', () => {
       reasoning: true,
     },
     {
-      id: 'glm-5.2',
-      name: 'GLM 5.2',
+      id: 'gm51model',
+      name: 'GLM-5.2',
       contextWindow: 180_000,
       inputModalities: ['text'],
       reasoning: false,
@@ -176,4 +176,62 @@ test('cancels first-use dynamic resolution with the caller signal', async (t) =>
   const resolution = adapter.resolveModel('qoder-cn', 'gmodel', controller.signal)
   controller.abort('test cancellation')
   await assert.rejects(resolution, error => error?.code === 'ABORTED')
+})
+
+test('keeps distinct upstream keys and renamed display names through discovery and generation', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+  let flashName = 'Qwen3.8-Flash'
+  let request
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/api/v1/jobToken/exchange')) {
+      return Response.json({ token: 'jt-model-identity', refresh_token: 'jrt-model-identity', expires_in: 86_400_000 })
+    }
+    if (url.endsWith('/api/v1/userinfo')) {
+      return Response.json({ id: 'identity-test', email: 'test@example.invalid', name: 'Test' })
+    }
+    if (url.endsWith('/algo/api/v2/model/list')) {
+      return Response.json({ chat: [
+        { key: 'qfmodel', enable: true, display_name: flashName, max_input_tokens: 200_000 },
+        { key: 'q36fmodel', enable: true, display_name: 'Qwen3.6-Flash' },
+        { key: 'kmodel', enable: true, display_name: 'Kimi-K2.8-Preview' },
+      ] })
+    }
+    if (init.method === 'POST') {
+      const alphabet = '_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!'
+      const base64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+      const swapped = [...String(init.body)].map(char => char === '$' ? '=' : base64[alphabet.indexOf(char)]).join('')
+      const third = Math.floor(swapped.length / 3)
+      const decoded = swapped.slice(-third) + swapped.slice(third, -third) + swapped.slice(0, third)
+      request = { headers: new Headers(init.headers), body: JSON.parse(Buffer.from(decoded, 'base64').toString()) }
+      return new Response('data: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    throw new Error(`Unexpected request: ${url}`)
+  }
+  const adapter = new QoderAdapter({
+    options: () => connection(),
+    resolveApiKey: async () => 'pt-model-identity-test',
+    resolveAttachments: () => undefined,
+  })
+  const listed = await adapter.listModels('qoder-cn')
+  assert.deepEqual(listed.map(({ id, name }) => ({ id, name })), [
+    { id: 'qfmodel', name: 'Qwen3.8-Flash' },
+    { id: 'q36fmodel', name: 'Qwen3.6-Flash' },
+    { id: 'kmodel', name: 'Kimi-K2.8-Preview' },
+  ])
+  flashName = 'Qwen3.9-Flash'
+  await adapter.listModels('qoder-cn')
+  const selected = await adapter.resolveModel('qoder-cn', listed[0].id)
+  assert.equal(selected.name, 'Qwen3.9-Flash')
+  assert.equal(selected.context.contextWindow, 200_000)
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    model: selected.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+  })) chunks.push(chunk)
+  assert.equal(request.headers.get('X-Model-Key'), 'qfmodel')
+  assert.equal(request.body.model_config.key, 'qfmodel')
+  assert.equal(request.body.chat_context.extra.modelConfig.key, 'qfmodel')
+  assert.ok(chunks.some(chunk => chunk.type === 'finish'))
 })

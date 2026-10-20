@@ -12,6 +12,7 @@
 import { EMPTY_RESPONSE_CODE, LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { DONE, type QoderEnvelope } from './sse.ts'
+import { httpErrorCode } from './errors.ts'
 import { splitThinking } from './thinking-parser.ts'
 
 /** Inner chunk shape carried inside the SSE envelope body. */
@@ -99,6 +100,22 @@ function parseInnerObject(body: unknown): QoderInnerChunk {
   return {}
 }
 
+/** Unwrap the gateway's JSON-encoded provider error before adding its request ID. */
+function upstreamErrorDetail(detail: string): string {
+  try {
+    const body = JSON.parse(detail)
+    const nested = typeof body?.details === 'string' ? JSON.parse(body.details) : body?.details
+    const message = nested?.error?.message ?? body?.error?.message ?? body?.message
+    if (typeof message === 'string' && message.length > 0) {
+      const requestId = typeof body?.request_id === 'string' ? ` (request_id: ${body.request_id})` : ''
+      return `${message.slice(0, 2000)}${requestId}`
+    }
+  } catch {
+    // Plain-text or malformed details must not hide the original provider failure.
+  }
+  return detail.slice(0, 2000)
+}
+
 /**
  * Consume decoded envelopes (ending with the `[DONE]` sentinel) and yield
  * StreamChunks. Reasoning, text, and tool-call deltas flow as they arrive;
@@ -151,9 +168,16 @@ export async function* translate(
       envelope = item
     }
     if (envelope.statusCodeValue !== 200) {
+      const status = envelope.statusCodeValue
+      const detail = typeof envelope.body === 'string'
+        ? envelope.body
+        : envelope.body === undefined
+          ? ''
+          : JSON.stringify(envelope.body)
       throw new LlmError(
-        `Qoder upstream status ${envelope.statusCodeValue}: ${String(envelope.body).slice(0, 200)}`,
-        'UPSTREAM',
+        `Qoder upstream status ${status}: ${upstreamErrorDetail(detail)}`,
+        httpErrorCode(status, detail),
+        status >= 100 && status <= 599 ? { status } : {},
       )
     }
 

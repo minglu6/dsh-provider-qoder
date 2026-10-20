@@ -55,7 +55,7 @@ import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
 
 // src/adapter.ts
 import crypto2 from "node:crypto";
-import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, isQuotaExceededError, LlmAdapter, LlmError as LlmError4, QUOTA_EXCEEDED_CODE, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
+import { attributionHeaders, LlmAdapter, LlmError as LlmError4, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import { idleWatchdog, timeoutOf } from "@deepseek-ai/dsh-timeout";
 
 // src/cosy.ts
@@ -117,44 +117,6 @@ function qoderChatUrl(endpoints) {
 }
 function qoderModelListUrl(endpoints) {
   return `${endpoints.gateway}/algo/api/v2/model/list`;
-}
-function getQoderCNDirectModel(modelID) {
-  return {
-    "qoder-cn": "auto",
-    "qwen3.7-max": "qmodel_latest",
-    "qwen3.7-plus": "qmodel",
-    "qwen3.6-plus": "qmodel",
-    "qwen3.6-flash": "q36fmodel",
-    "deepseek-v4-pro": "dmodel",
-    "deepseek-v4-flash": "dfmodel",
-    "glm-5.2": "gm51model",
-    "glm-5.1": "gm51model",
-    "kimi-k2.6": "kmodel",
-    "minimax-m2.7": "mmodel",
-    "minimax-m3": "mmodel"
-  }[modelID || ""] || modelID || "auto";
-}
-var qoderCNFriendlyModels = {
-  auto: { id: "auto", name: "Auto" },
-  "qoder-cn": { id: "qoder-cn", name: "Auto" },
-  qmodel_latest: { id: "qwen3.7-max", name: "Qwen 3.7 Max" },
-  qmodel: { id: "qwen3.7-plus", name: "Qwen 3.7 Plus" },
-  q36fmodel: { id: "qwen3.6-flash", name: "Qwen 3.6 Flash" },
-  qfmodel: { id: "qwen3.6-flash", name: "Qwen 3.6 Flash" },
-  dmodel: { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
-  dfmodel: { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
-  gm51model: { id: "glm-5.2", name: "GLM 5.2" },
-  kmodel: { id: "kimi-k2.6", name: "Kimi K2.6" },
-  mmodel: { id: "minimax-m2.7", name: "MiniMax M2.7" }
-};
-function prettifyQoderCNModelName(name2) {
-  return (name2 || "Model").replace(/\s*·\s*Qoder CN\s*$/i, "").replace(/Qwen(\d)/g, "Qwen $1").replace(/Qwen([\d.]+)-/g, "Qwen $1 ").replace(/DeepSeek\s*V(\d)-/g, "DeepSeek V$1 ").replace(/\s+/g, " ").trim();
-}
-function getQoderCNFriendlyModelInfo(key, display) {
-  return qoderCNFriendlyModels[key] ?? {
-    id: key,
-    name: prettifyQoderCNModelName(display ?? key)
-  };
 }
 function rsaEncryptBase64(data) {
   const encrypted = crypto.publicEncrypt(
@@ -267,6 +229,28 @@ function parseVpcInstanceFromEnvironment(get) {
   );
 }
 
+// src/errors.ts
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  isContextWindowExceededError,
+  isQuotaExceededError,
+  QUOTA_EXCEEDED_CODE
+} from "@deepseek-ai/dsh-llm";
+function httpErrorCode(status, detail) {
+  if (status === 401 || status === 403) return "AUTH";
+  if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE;
+  if (status === 429) return "RATE_LIMIT";
+  if (status === 400) {
+    if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE;
+    return "INVALID_REQUEST";
+  }
+  if (status >= 500) return "SERVER";
+  return `HTTP_${status}`;
+}
+function isAuthExpiredStatus(status) {
+  return status === 401 || status === 403;
+}
+
 // src/qoder-encoding.ts
 var qoderCustomAlphabet = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
 var qoderStdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -300,6 +284,13 @@ function parseExpiry(data) {
   }
   return Date.now() + 24 * 60 * 60 * 1e3;
 }
+function parseIssuedAt(data) {
+  if (data.created_at) {
+    const parsed = Date.parse(data.created_at);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return Date.now();
+}
 async function exchangeJobToken(pat, endpoints, signal) {
   const res = await fetch(`${endpoints.openapi}/api/v1/jobToken/exchange`, {
     method: "POST",
@@ -324,7 +315,8 @@ async function exchangeJobToken(pat, endpoints, signal) {
   return {
     jobToken: data.token,
     jobRefreshToken: data.refresh_token || "",
-    expiresAt: parseExpiry(data)
+    expiresAt: parseExpiry(data),
+    issuedAt: parseIssuedAt(data)
   };
 }
 async function refreshJobToken(jobRefreshToken, endpoints, signal) {
@@ -354,7 +346,8 @@ async function refreshJobToken(jobRefreshToken, endpoints, signal) {
   return {
     jobToken: data.token,
     jobRefreshToken: data.refresh_token || jobRefreshToken,
-    expiresAt: parseExpiry(data)
+    expiresAt: parseExpiry(data),
+    issuedAt: parseIssuedAt(data)
   };
 }
 async function fetchUserInfo(jobToken, endpoints, signal) {
@@ -467,7 +460,10 @@ async function serializeMessages(options, attachments) {
           toolCalls.push(call);
         }
       }
-      const mapped = { role: "assistant", content: content || null };
+      const mapped = {
+        role: "assistant",
+        content: content || (toolCalls.length > 0 ? "(tool call)" : null)
+      };
       if (toolCalls.length > 0) {
         mapped.tool_calls = toolCalls;
       }
@@ -624,6 +620,19 @@ function parseInnerObject(body) {
   }
   return {};
 }
+function upstreamErrorDetail(detail) {
+  try {
+    const body = JSON.parse(detail);
+    const nested = typeof body?.details === "string" ? JSON.parse(body.details) : body?.details;
+    const message = nested?.error?.message ?? body?.error?.message ?? body?.message;
+    if (typeof message === "string" && message.length > 0) {
+      const requestId = typeof body?.request_id === "string" ? ` (request_id: ${body.request_id})` : "";
+      return `${message.slice(0, 2e3)}${requestId}`;
+    }
+  } catch {
+  }
+  return detail.slice(0, 2e3);
+}
 async function* translate(envelopes, reasoningEnabled = true) {
   let nextIndex = 0;
   let textBlock;
@@ -660,9 +669,12 @@ async function* translate(envelopes, reasoningEnabled = true) {
       envelope = item;
     }
     if (envelope.statusCodeValue !== 200) {
+      const status = envelope.statusCodeValue;
+      const detail = typeof envelope.body === "string" ? envelope.body : envelope.body === void 0 ? "" : JSON.stringify(envelope.body);
       throw new LlmError3(
-        `Qoder upstream status ${envelope.statusCodeValue}: ${String(envelope.body).slice(0, 200)}`,
-        "UPSTREAM"
+        `Qoder upstream status ${status}: ${upstreamErrorDetail(detail)}`,
+        httpErrorCode(status, detail),
+        status >= 100 && status <= 599 ? { status } : {}
       );
     }
     let inner;
@@ -765,6 +777,20 @@ var modelCatalogCache = /* @__PURE__ */ new Map();
 function hashCredential(value) {
   return crypto2.createHash("sha256").update(value).digest("hex");
 }
+var JOB_TOKEN_MAX_AGE_MS = 30 * 60 * 1e3;
+var JOB_TOKEN_EXPIRY_SLACK_MS = 5 * 60 * 1e3;
+function sessionCacheKey(endpoints, rawPat) {
+  return `${endpoints.gateway}\0${endpoints.openapi}\0${hashCredential(rawPat)}`;
+}
+function invalidateJobToken(endpoints, rawPat) {
+  jobTokenCache.delete(sessionCacheKey(endpoints, rawPat));
+}
+function isAuthExpiredError(error) {
+  return error instanceof LlmError4 && (error.code === "AUTH" || isAuthExpiredStatus(error.failure.status));
+}
+function jobTokenUsable(session) {
+  return session.expiresAt > Date.now() + JOB_TOKEN_EXPIRY_SLACK_MS && session.issuedAt + JOB_TOKEN_MAX_AGE_MS > Date.now();
+}
 function recordOf(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : void 0;
 }
@@ -797,14 +823,13 @@ function parseQoderModelCatalog(value) {
     const key = typeof entry?.key === "string" ? entry.key.trim() : "";
     if (key.length === 0 || entry?.enable !== true) continue;
     const display = typeof entry.display_name === "string" && entry.display_name.trim().length > 0 ? entry.display_name.trim() : key;
-    const identity = getQoderCNFriendlyModelInfo(key, display);
-    if (seen.has(identity.id)) continue;
-    seen.add(identity.id);
+    if (seen.has(key)) continue;
+    seen.add(key);
     const contextWindow = contextWindowOf(entry);
     const maxTokens = positiveInteger(entry.max_output_tokens);
     models.push({
-      id: identity.id,
-      name: identity.name,
+      id: key,
+      name: display,
       ...contextWindow === void 0 ? {} : { contextWindow },
       ...maxTokens === void 0 ? {} : { maxTokens },
       inputModalities: entry.is_vl === true ? ["text", "image"] : ["text"],
@@ -815,17 +840,6 @@ function parseQoderModelCatalog(value) {
     throw new LlmError4("Qoder CN model listing contains no enabled usable models", "DISCOVERY_FAILED");
   }
   return models;
-}
-function httpErrorCode(status, detail) {
-  if (status === 401 || status === 403) return "AUTH";
-  if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE;
-  if (status === 429) return "RATE_LIMIT";
-  if (status === 400) {
-    if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE;
-    return "INVALID_REQUEST";
-  }
-  if (status >= 500) return "SERVER";
-  return `HTTP_${status}`;
 }
 function modelInfo(provider, model) {
   return {
@@ -881,67 +895,77 @@ var QoderAdapter = class extends LlmAdapter {
     return models;
   }
   async fetchModelCatalog(connection, rawPat, signal) {
-    let jobToken;
-    let identity;
-    try {
-      jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal);
-      identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal);
-    } catch (error) {
-      if (signal?.aborted) {
-        throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
-      }
-      if (error instanceof LlmError4) throw error;
-      throw new LlmError4("Qoder CN model discovery could not authenticate", "DISCOVERY_FAILED", {
-        cause: error
-      });
-    }
     const url = qoderModelListUrl(connection.endpoints);
-    const headers = buildQoderAuthHeaders(null, url, {
-      userID: identity.userID,
-      authToken: jobToken,
-      name: identity.name,
-      email: identity.email,
-      machineID: connection.machineId
-    });
-    let response;
-    try {
-      response = await fetch(url, {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          ...headers,
-          ...attributionHeaders()
-        },
-        signal
-      });
-    } catch (error) {
-      if (signal?.aborted) {
-        throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+    for (let attempt = 0; ; attempt++) {
+      let jobToken;
+      let identity;
+      try {
+        jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal);
+        identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal);
+      } catch (error) {
+        if (signal?.aborted) {
+          throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+        }
+        if (attempt === 0 && isAuthExpiredError(error)) {
+          invalidateJobToken(connection.endpoints, rawPat);
+          continue;
+        }
+        if (error instanceof LlmError4) throw error;
+        throw new LlmError4("Qoder CN model discovery could not authenticate", "DISCOVERY_FAILED", {
+          cause: error
+        });
       }
-      throw new LlmError4(`Could not reach Qoder CN model listing at ${url}`, "DISCOVERY_FAILED", {
-        cause: error
+      const headers = buildQoderAuthHeaders(null, url, {
+        userID: identity.userID,
+        authToken: jobToken,
+        name: identity.name,
+        email: identity.email,
+        machineID: connection.machineId
       });
-    }
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new LlmError4(
-        `Qoder CN model listing answered HTTP ${response.status}${detail.length > 0 ? `: ${detail.slice(0, 200)}` : ""}`,
-        "DISCOVERY_FAILED",
-        { status: response.status }
-      );
-    }
-    let value;
-    try {
-      value = await response.json();
-    } catch (error) {
-      if (signal?.aborted) {
-        throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+      let response;
+      try {
+        response = await fetch(url, {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            ...headers,
+            ...attributionHeaders()
+          },
+          signal
+        });
+      } catch (error) {
+        if (signal?.aborted) {
+          throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+        }
+        throw new LlmError4(`Could not reach Qoder CN model listing at ${url}`, "DISCOVERY_FAILED", {
+          cause: error
+        });
       }
-      throw new LlmError4("Qoder CN model listing did not answer with JSON", "DISCOVERY_FAILED", {
-        cause: error
-      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        if (attempt === 0 && isAuthExpiredStatus(response.status)) {
+          invalidateJobToken(connection.endpoints, rawPat);
+          continue;
+        }
+        throw new LlmError4(
+          `Qoder CN model listing answered HTTP ${response.status}${detail.length > 0 ? `: ${detail.slice(0, 200)}` : ""}`,
+          httpErrorCode(response.status, detail),
+          { status: response.status }
+        );
+      }
+      let value;
+      try {
+        value = await response.json();
+      } catch (error) {
+        if (signal?.aborted) {
+          throw new LlmError4("Qoder CN model discovery aborted by caller", "ABORTED", { cause: error });
+        }
+        throw new LlmError4("Qoder CN model listing did not answer with JSON", "DISCOVERY_FAILED", {
+          cause: error
+        });
+      }
+      return parseQoderModelCatalog(value);
     }
-    return parseQoderModelCatalog(value);
   }
   async *stream(options) {
     var _stack = [];
@@ -999,135 +1023,169 @@ var QoderAdapter = class extends LlmAdapter {
     }
   }
   async *request(options, signal, connection, rawPat, onComment) {
-    const jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal);
-    const identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal);
-    const machineId = connection.machineId;
-    const qoderModel = getQoderCNDirectModel(options.model);
+    const qoderModel = options.model;
     const attachments = this.config.resolveAttachments();
     const messages = await serializeMessages(options, attachments);
     const tools = transformTools(options);
     const system = options.system ?? "";
     const originalContent = lastUserText(options.messages);
-    const requestId = crypto2.randomUUID();
-    const sessionID = crypto2.createHash("sha256").update(`qoder-session\0${identity.userID}\0${qoderModel}`).digest("hex").slice(0, 16);
     const recordID = stableChatRecordID(qoderModel, options);
     const maxTokens = options.maxTokens ?? connection.maxTokens;
     const reasoningEnabled = options.reasoningEffort !== void 0 && options.reasoningEffort !== "off";
-    const reqBody = {
-      request_id: requestId,
-      request_set_id: recordID,
-      chat_record_id: recordID,
-      session_id: sessionID,
-      stream: true,
-      chat_task: "FREE_INPUT",
-      is_reply: true,
-      is_retry: false,
-      source: 1,
-      version: "3",
-      session_type: "qodercli",
-      agent_id: "agent_common",
-      task_id: "common",
-      code_language: "",
-      chat_prompt: "",
-      image_urls: null,
-      aliyun_user_type: "",
-      system,
-      messages,
-      tools: tools ?? [],
-      parameters: {
-        max_tokens: maxTokens,
-        ...reasoningEnabled ? { reasoning_effort: options.reasoningEffort } : {}
-      },
-      chat_context: {
-        chatPrompt: "",
-        imageUrls: null,
-        extra: {
-          context: [],
-          modelConfig: {
-            key: qoderModel,
-            is_reasoning: reasoningEnabled
-          },
-          originalContent
-        },
-        features: [],
-        text: originalContent
-      },
-      model_config: {
-        key: qoderModel,
-        is_reasoning: reasoningEnabled,
-        max_output_tokens: maxTokens,
-        source: "system"
-      },
-      business: {
-        product: "cli",
-        version: "1.0.0",
-        type: "agent",
-        stage: "start",
-        id: crypto2.randomUUID(),
-        name: originalContent.substring(0, 30),
-        begin_at: Date.now()
-      }
-    };
-    const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-    const encodedBody = qoderEncodeBody(bodyBytes);
-    const encodedBytes = Buffer.from(encodedBody, "utf8");
     const chatURL = qoderChatUrl(connection.endpoints);
-    const cosyCreds = {
-      userID: identity.userID,
-      authToken: jobToken,
-      name: identity.name,
-      email: identity.email,
-      machineID: machineId
-    };
-    const headers = buildQoderAuthHeaders(encodedBytes, chatURL, cosyCreds);
-    let response;
-    try {
-      response = await fetch(chatURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Accept-Encoding": "identity",
-          "X-Model-Key": qoderModel,
-          "X-Model-Source": "system",
-          ...headers,
-          ...attributionHeaders()
-        },
-        body: encodedBytes,
-        signal
-      });
-    } catch (error) {
-      if (signal.aborted) throw error;
-      throw new LlmError4(
-        `Qoder CN API request to ${chatURL} failed`,
-        "TRANSPORT",
-        { cause: error }
-      );
-    }
-    if (!response.ok) {
-      let message = `Qoder CN API error (HTTP ${response.status})`;
-      let bodyText = "";
+    for (let attempt = 0; ; attempt++) {
+      let jobToken;
+      let identity;
       try {
-        bodyText = await response.text();
-        if (bodyText.length > 0) message = bodyText.slice(0, 200);
-      } catch {
+        jobToken = await this.ensureJobToken(rawPat, connection.endpoints, signal);
+        identity = await this.ensureIdentity(rawPat, jobToken, connection.endpoints, signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (attempt === 0 && isAuthExpiredError(error)) {
+          invalidateJobToken(connection.endpoints, rawPat);
+          continue;
+        }
+        throw error;
       }
-      throw new LlmError4(message, httpErrorCode(response.status, bodyText), {
-        status: response.status
-      });
+      const requestId = crypto2.randomUUID();
+      const sessionID = crypto2.createHash("sha256").update(`qoder-session\0${identity.userID}\0${qoderModel}`).digest("hex").slice(0, 16);
+      const reqBody = {
+        request_id: requestId,
+        request_set_id: recordID,
+        chat_record_id: recordID,
+        session_id: sessionID,
+        stream: true,
+        chat_task: "FREE_INPUT",
+        is_reply: true,
+        is_retry: false,
+        source: 1,
+        version: "3",
+        session_type: "qodercli",
+        agent_id: "agent_common",
+        task_id: "common",
+        code_language: "",
+        chat_prompt: "",
+        image_urls: null,
+        aliyun_user_type: "",
+        system,
+        messages,
+        tools: tools ?? [],
+        parameters: {
+          max_tokens: maxTokens,
+          ...reasoningEnabled ? { reasoning_effort: options.reasoningEffort } : {}
+        },
+        chat_context: {
+          chatPrompt: "",
+          imageUrls: null,
+          extra: {
+            context: [],
+            modelConfig: {
+              key: qoderModel,
+              is_reasoning: reasoningEnabled
+            },
+            originalContent
+          },
+          features: [],
+          text: originalContent
+        },
+        model_config: {
+          key: qoderModel,
+          is_reasoning: reasoningEnabled,
+          max_output_tokens: maxTokens,
+          source: "system"
+        },
+        business: {
+          product: "cli",
+          version: "1.0.0",
+          type: "agent",
+          stage: "start",
+          id: crypto2.randomUUID(),
+          name: originalContent.substring(0, 30),
+          begin_at: Date.now()
+        }
+      };
+      const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+      const encodedBody = qoderEncodeBody(bodyBytes);
+      const encodedBytes = Buffer.from(encodedBody, "utf8");
+      const cosyCreds = {
+        userID: identity.userID,
+        authToken: jobToken,
+        name: identity.name,
+        email: identity.email,
+        machineID: connection.machineId
+      };
+      const headers = buildQoderAuthHeaders(encodedBytes, chatURL, cosyCreds);
+      let response;
+      try {
+        response = await fetch(chatURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+            "X-Model-Key": qoderModel,
+            "X-Model-Source": "system",
+            ...headers,
+            ...attributionHeaders()
+          },
+          body: encodedBytes,
+          signal
+        });
+      } catch (error) {
+        if (signal.aborted) throw error;
+        throw new LlmError4(
+          `Qoder CN API request to ${chatURL} failed`,
+          "TRANSPORT",
+          { cause: error }
+        );
+      }
+      if (!response.ok) {
+        let message = `Qoder CN API error (HTTP ${response.status})`;
+        let bodyText = "";
+        try {
+          bodyText = await response.text();
+          if (bodyText.length > 0) message = bodyText.slice(0, 200);
+        } catch {
+        }
+        if (attempt === 0 && isAuthExpiredStatus(response.status)) {
+          invalidateJobToken(connection.endpoints, rawPat);
+          continue;
+        }
+        throw new LlmError4(message, httpErrorCode(response.status, bodyText), {
+          status: response.status
+        });
+      }
+      if (!response.body) {
+        throw new LlmError4("Qoder CN API returned no response body", "EMPTY_RESPONSE");
+      }
+      const envelopes = parseQoderSse(response.body);
+      let emitted = false;
+      try {
+        for await (const chunk of translate(mapEnvelopes(envelopes, onComment), reasoningEnabled)) {
+          emitted = true;
+          yield chunk;
+        }
+      } catch (error) {
+        if (attempt === 0 && !emitted && isAuthExpiredError(error)) {
+          invalidateJobToken(connection.endpoints, rawPat);
+          continue;
+        }
+        throw error;
+      }
+      return;
     }
-    if (!response.body) {
-      throw new LlmError4("Qoder CN API returned no response body", "EMPTY_RESPONSE");
-    }
-    const envelopes = parseQoderSse(response.body);
-    yield* translate(mapEnvelopes(envelopes, onComment), reasoningEnabled);
   }
-  /** Exchange or refresh the job token for one PAT, caching per process. */
+  /**
+   * Exchange or refresh the job token for one PAT + endpoint set, caching per
+   * process. Sessions rotate by age (`JOB_TOKEN_MAX_AGE_MS`) because the
+   * advertised 24h TTL has proven optimistic; the jrt is preferred while the
+   * session is otherwise usable.
+   */
   async ensureJobToken(rawPat, endpoints, signal) {
-    const key = hashCredential(rawPat);
+    const key = sessionCacheKey(endpoints, rawPat);
     const cached = jobTokenCache.get(key);
-    if (cached !== void 0 && cached.expiresAt > Date.now() + 5 * 60 * 1e3) {
+    if (cached !== void 0 && jobTokenUsable(cached)) {
       return cached.jobToken;
     }
     if (cached !== void 0 && cached.jobRefreshToken.length > 0) {
@@ -1156,7 +1214,7 @@ var QoderAdapter = class extends LlmAdapter {
   }
   /** Resolve the server identity for one PAT, caching per process. */
   async ensureIdentity(rawPat, jobToken, endpoints, signal) {
-    const key = hashCredential(rawPat);
+    const key = sessionCacheKey(endpoints, rawPat);
     const cached = identityCache.get(key);
     if (cached?.userID) return cached;
     const info = await fetchUserInfo(jobToken, endpoints, signal);
@@ -1428,7 +1486,6 @@ export {
   buildQoderAuthHeaders,
   exchangeJobToken,
   fetchUserInfo,
-  getQoderCNDirectModel,
   inject,
   name,
   parseQoderModelCatalog,

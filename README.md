@@ -46,9 +46,21 @@ The bundle mounts the `llm-qoder` entry. Its live configuration is persisted thr
 
 An existing `providers.qoder-cn` profile overrides only the fields it declares and inherits other root fields. The card edits that profile when present, otherwise the root. An explicit empty VPC instance selects public cloud instead of an inherited or environment-provided tenant. Empty URL overrides derive endpoints from the selected VPC or public cloud. Advanced configuration and model overrides not edited by the card are preserved.
 
-Unless `models` is configured, the adapter fetches Qoder's signed live catalog from `/algo/api/v2/model/list` whenever DSH lists the provider. Newly released wire keys such as `gmodel` therefore appear without a plugin update; known wire keys retain stable selector ids such as `gm51model` → `glm-5.2`. Exact-model resolution reuses the latest successful catalog in the current process.
+Unless `models` is configured, the adapter fetches Qoder's signed live catalog from `/algo/api/v2/model/list` whenever DSH lists the provider. Model IDs are the upstream `key`, and labels are the upstream `display_name` (or the key when no name is supplied). Generation sends that same key unchanged in its headers and body. Distinct keys remain distinct even when their display names match.
 
-`models` remains an optional complete static override for deployments that intentionally pin the selector catalog. It replaces live discovery rather than extending it. Authentication, transport, invalid JSON, and empty-catalog failures surface as discovery errors instead of falling back to an obsolete built-in list.
+Exact-model resolution reuses the latest successful catalog in the current process. The DSH browser also caches its model selector catalog: opening the menu repeatedly does not poll Qoder. Reload the page to request a fresh catalog, or let settings, credentials, or adapter changes trigger its refresh.
+
+`models` remains an optional complete static override for deployments that intentionally pin the selector catalog. Every configured `id` must be an upstream wire key. This list replaces live discovery rather than extending it. Authentication failures surface as `AUTH` (and a rejected job-token session is dropped and retried once after a fresh exchange), transport, invalid JSON, and empty-catalog failures surface as discovery errors instead of falling back to a built-in list.
+
+### Model-ID migration
+
+Saved selections or static catalogs using versioned aliases such as `qwen3.6-flash`, `kimi-k2.6`, or `glm-5.2` must be reselected from the live directory or changed to the intended upstream key. Do not infer the key from an old version label: Qoder can rename or replace the model behind a key. `auto` is unchanged. Historical session logs are not rewritten. The `getQoderCNDirectModel` helper is no longer exported; callers send the selected upstream key directly.
+
+### Tool-call history compatibility
+
+Qoder can reject tool results when the preceding assistant message contains only tool calls and has `content: null`. The adapter adds a non-empty `(tool call)` marker to that assistant message on the wire, preserving call IDs, arguments, result order, and stored session history. Existing text and reasoning remain unchanged. After installing the updated plugin and restarting the Host, affected conversations can be retried without rewriting their history.
+
+In-band upstream errors expose the nested provider message and gateway request ID rather than truncating the JSON wrapper before the actionable detail. Error classification and authentication retry behavior are unchanged.
 
 ## Development
 

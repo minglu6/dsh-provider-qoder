@@ -37,7 +37,7 @@ export {
 } from './adapter.ts'
 export type { QoderAdapterOptions, QoderCatalogModel, QoderConnectionOptions } from './adapter.ts'
 export { qoderEncodeBody } from './qoder-encoding.ts'
-export { buildQoderAuthHeaders, qoderCnEndpoints, getQoderCNDirectModel } from './cosy.ts'
+export { buildQoderAuthHeaders, qoderCnEndpoints } from './cosy.ts'
 export { exchangeJobToken, refreshJobToken, fetchUserInfo } from './pat.ts'
 
 export const name = 'llm-qoder'
