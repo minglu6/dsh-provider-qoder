@@ -799,6 +799,90 @@ async function* translate(envelopes) {
   throw new LlmError3("Qoder SSE payload stream ended without [DONE]", "STREAM_CLOSED");
 }
 
+// src/response-guard.ts
+function isConversationCheckpoint(text) {
+  const match = /^\s*<analysis>[\s\S]*?<\/analysis>[\s>]*<summary>([\s\S]*)$/i.exec(text);
+  const body = match?.[1];
+  if (body === void 0) return false;
+  const closing = body.toLowerCase().indexOf("</summary>");
+  if (closing !== -1 && body.slice(closing + "</summary>".length).trim()) return false;
+  const summary = closing === -1 ? body : body.slice(0, closing);
+  const headings = [
+    /Primary Request and Intent|主要请求与意图/i,
+    /Key Technical Concepts|关键技术概念/i,
+    /Files and Code(?: Sections)?|文件与代码段/i,
+    /All User Messages|所有用户消息/i,
+    /Pending Tasks|Pending Jobs|待办任务/i,
+    /Current Work|当前工作/i,
+    /Optional Next Step|Next Step|可选的下一步/i
+  ];
+  return headings.filter((heading) => heading.test(summary)).length >= 3;
+}
+function requestsSummary(options) {
+  for (let i = options.messages.length - 1; i >= 0; i--) {
+    const message = options.messages[i];
+    if (message === void 0 || message.role !== "user" || message.source !== void 0 && message.source.kind !== "user") continue;
+    const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+    return /\b(?:summari[sz]e|recap|compact|handoff|handover)\b|\b(?:write|provide|give|create|produce|output)\b[^\n]{0,40}\bsummary\b|(?:请|帮我|麻烦)?(?:总结|概括|汇总|压缩)(?:一下|这|本|当前|对话|会话|此前)|(?:输出|生成|提供|给我|写)[^\n]{0,30}(?:summary|摘要|总结)/i.test(text);
+  }
+  return false;
+}
+async function* recoverCheckpoint(createAttempt, options) {
+  if (options.purpose !== void 0 || requestsSummary(options)) {
+    yield* createAttempt(false);
+    return;
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    options.signal?.throwIfAborted();
+    const pending = [];
+    let text = "";
+    let released = false;
+    let finish;
+    try {
+      for await (const chunk of createAttempt(attempt > 0)) {
+        if (released) {
+          yield chunk;
+          continue;
+        }
+        pending.push(chunk);
+        if (chunk.type === "finish") finish = chunk;
+        if (chunk.type === "text-delta") text += chunk.text;
+        const prefix = text.trimStart().toLowerCase();
+        if (chunk.type === "block-start" && chunk.blockType === "tool-call" || chunk.type === "text-delta" && !"<analysis>".startsWith(prefix) && !prefix.startsWith("<analysis>")) {
+          yield* pending;
+          pending.length = 0;
+          released = true;
+        }
+      }
+    } catch (error) {
+      if (!released && !options.signal?.aborted && !isConversationCheckpoint(text)) yield* pending;
+      throw error;
+    }
+    if (released) return;
+    options.signal?.throwIfAborted();
+    if (isConversationCheckpoint(text)) {
+      if (finish?.reason.kind === "error" || finish?.reason.kind === "aborted") {
+        yield finish;
+        return;
+      }
+      if (attempt === 0) continue;
+      yield {
+        type: "finish",
+        reason: {
+          kind: "error",
+          failure: {
+            code: "QODER_UNEXPECTED_SUMMARY",
+            message: "Qoder returned an unsolicited conversation checkpoint after one recovery attempt. No answer or tool call was accepted. Retry in a new session or switch models."
+          }
+        }
+      };
+      return;
+    }
+    yield* pending;
+    return;
+  }
+}
+
 // src/adapter.ts
 var DEFAULT_STREAM_IDLE_TIMEOUT_MS = 3e5;
 var DEFAULT_CONTEXT_WINDOW = 1e6;
@@ -1016,15 +1100,16 @@ var QoderAdapter = class extends LlmAdapter {
       const consumer = new AbortController();
       const upstream = options.signal === void 0 ? consumer.signal : AbortSignal.any([options.signal, consumer.signal]);
       const watchdog = __using(_stack, idleWatchdog(upstream, connection.streamIdleTimeoutMs, STREAM_IDLE_TIMEOUT_CODE));
-      const iterator = this.request(
+      const iterator = recoverCheckpoint((recovery) => this.request(
         options,
         watchdog.signal,
         connection,
         rawPat,
         () => {
           watchdog.pulse();
-        }
-      )[Symbol.asyncIterator]();
+        },
+        recovery
+      ), options)[Symbol.asyncIterator]();
       let exhausted = false;
       try {
         while (true) {
@@ -1052,7 +1137,7 @@ var QoderAdapter = class extends LlmAdapter {
         consumer.abort("Qoder CN stream consumer stopped");
         if (!exhausted && iterator.return !== void 0) {
           try {
-            await iterator.return();
+            await iterator.return(void 0);
           } catch (_abortedTransportTeardown) {
           }
         }
@@ -1063,14 +1148,14 @@ var QoderAdapter = class extends LlmAdapter {
       __callDispose(_stack, _error, _hasError);
     }
   }
-  async *request(options, signal, connection, rawPat, onComment) {
+  async *request(options, signal, connection, rawPat, onComment, recovery = false) {
     const qoderModel = options.model;
     const attachments = this.config.resolveAttachments();
     const messages = await serializeMessages(options, attachments);
     const tools = transformTools(options);
-    const system = options.system ?? "";
+    const system = (options.system ?? "") + (recovery ? "\n\nThis is not a compaction request. Complete the latest user task using the supplied conversation and existing tool results. Return an answer or a structured tool call, not an internal conversation checkpoint. Do not repeat completed tool actions." : "");
     const originalContent = lastUserText(options.messages);
-    const recordID = stableChatRecordID(qoderModel, options);
+    const sessionScope = recovery ? crypto2.randomUUID() : options.sessionId ?? crypto2.randomUUID();
     const maxTokens = options.maxTokens ?? connection.maxTokens;
     const reasoningEnabled = options.reasoningEffort !== void 0 && options.reasoningEffort !== "off";
     const chatURL = qoderChatUrl(connection.endpoints);
@@ -1089,7 +1174,24 @@ var QoderAdapter = class extends LlmAdapter {
         throw error;
       }
       const requestId = crypto2.randomUUID();
-      const sessionID = crypto2.createHash("sha256").update(`qoder-session\0${identity.userID}\0${qoderModel}`).digest("hex").slice(0, 16);
+      const sessionID = crypto2.createHash("sha256").update(JSON.stringify([
+        "qoder-session",
+        connection.endpoints.gateway,
+        identity.userID,
+        options.provider,
+        qoderModel,
+        sessionScope,
+        options.purpose ?? "conversation"
+      ])).digest("hex").slice(0, 16);
+      const recordID = crypto2.createHash("sha256").update(JSON.stringify({
+        sessionID,
+        model: qoderModel,
+        messages,
+        tools,
+        system,
+        maxTokens,
+        reasoningEffort: options.reasoningEffort
+      })).digest("hex").slice(0, 16);
       const reqBody = {
         request_id: requestId,
         request_set_id: recordID,
@@ -1274,33 +1376,6 @@ var QoderAdapter = class extends LlmAdapter {
     return resolved;
   }
 };
-function stableChatRecordID(model, options) {
-  const hash = crypto2.createHash("sha256");
-  hash.update("qoder-record");
-  hash.update("\0");
-  hash.update(model);
-  for (const msg of options.messages) {
-    hash.update("\0");
-    hash.update(msg.role);
-    if (msg.role === "tool") hash.update(msg.toolCallId);
-    for (const block of msg.content) {
-      hash.update("\0");
-      hash.update(block.type);
-      if (block.type === "text" || block.type === "reasoning") hash.update(block.text);
-      if (block.type === "tool-call") {
-        hash.update(block.name);
-        hash.update(block.arguments);
-      }
-    }
-  }
-  if (options.system !== void 0) {
-    hash.update("\0");
-    hash.update(options.system);
-  }
-  hash.update("\0");
-  hash.update(`mt=${options.maxTokens ?? "default"}`);
-  return hash.digest("hex").slice(0, 16);
-}
 async function* mapEnvelopes(payloads, onComment) {
   for await (const payload of payloads) {
     onComment();

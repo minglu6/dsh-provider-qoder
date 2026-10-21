@@ -61,7 +61,7 @@ try {
     external: ['react', 'react/jsx-runtime', '@deepseek-ai/*'],
     define: { 'process.env.NODE_ENV': '"production"' },
     banner: {
-      js: 'window.__ModuleLoader__.load({ id: "dsh-provider-qoder", factory: (require) => { var module = { exports: {} }; var exports = module.exports;',
+      js: 'window.__ModuleLoader__.load({ id: "@lightmanlu/dsh-provider-qoder", factory: (require) => { var module = { exports: {} }; var exports = module.exports;',
     },
     footer: { js: 'return module.exports; } });' },
   })

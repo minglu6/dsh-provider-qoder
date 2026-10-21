@@ -1,6 +1,6 @@
 {
-  "name": "dsh-provider-qoder",
-  "version": "0.1.1",
+  "name": "@lightmanlu/dsh-provider-qoder",
+  "version": "0.1.2",
   "description": "Qoder CN adapter plugin for DeepSeek Harness: COSY-signed, WAF-encoded streaming against gateway.qoder.com.cn",
   "type": "module",
   "license": "MIT",

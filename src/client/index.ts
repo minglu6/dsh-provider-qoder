@@ -31,7 +31,7 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(localeNamespace, { en, zh }), 'qoder-cn: card locales')
   ctx.effect(() => {
     const style = document.createElement('style')
-    style.dataset.plugin = 'dsh-provider-qoder'
+    style.dataset.plugin = '@lightmanlu/dsh-provider-qoder'
     style.textContent = css
     document.head.appendChild(style)
     return () => { style.remove() }

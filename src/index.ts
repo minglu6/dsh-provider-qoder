@@ -5,7 +5,7 @@
  * through the optional credential seam (`ctx.credentials`). An in-flight
  * stream retains the endpoint, VPC instance, and credential reference it
  * started with.
- * @module dsh-provider-qoder
+ * @module @lightmanlu/dsh-provider-qoder
  */
 
 import type { Context, Fiber, Volatile } from '@deepseek-ai/cordis'

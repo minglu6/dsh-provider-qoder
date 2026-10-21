@@ -1,4 +1,4 @@
-window.__ModuleLoader__.load({ id: "dsh-provider-qoder", factory: (require) => { var module = { exports: {} }; var exports = module.exports;
+window.__ModuleLoader__.load({ id: "@lightmanlu/dsh-provider-qoder", factory: (require) => { var module = { exports: {} }; var exports = module.exports;
 "use strict";
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -335,7 +335,7 @@ function apply(ctx) {
   ctx.effect(() => ctx.locale.register(localeNamespace, { en, zh }), "qoder-cn: card locales");
   ctx.effect(() => {
     const style = document.createElement("style");
-    style.dataset.plugin = "dsh-provider-qoder";
+    style.dataset.plugin = "@lightmanlu/dsh-provider-qoder";
     style.textContent = card_default;
     document.head.appendChild(style);
     return () => {

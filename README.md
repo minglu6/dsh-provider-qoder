@@ -1,4 +1,4 @@
-# dsh-provider-qoder
+# @lightmanlu/dsh-provider-qoder
 
 Qoder CN adapter plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
@@ -9,7 +9,7 @@ Installs the `qoder-cn` provider route: COSY-signed, WAF-encoded streaming again
 Requires DeepSeek Harness `0.2.1-alpha.1` or newer in the `0.2.x` line and pnpm. Verified against the official `0.2.1-alpha.2` runtime.
 
 ```sh
-dsh plugin --profile web add github:minglu6/dsh-provider-qoder
+dsh plugin --profile web add @lightmanlu/dsh-provider-qoder
 dsh web
 ```
 
@@ -17,7 +17,7 @@ Open **Settings → Models → Qoder CN → Edit connection**. This card ships w
 
 The card never reads back the PAT. Leaving its input empty preserves the existing credential; environment-owned credentials are read-only. Connection changes take effect on the next request. If configuration saves but credential storage fails, the card keeps the token draft and reports the partial save for retry. A stale configuration revision is rejected before writing a token.
 
-The npm package named `dsh-provider-qoder` belongs to a different project. Install this implementation from `github:minglu6/dsh-provider-qoder`, or link this local checkout after building:
+The unscoped npm package `dsh-provider-qoder` belongs to a different project. This implementation is published as `@lightmanlu/dsh-provider-qoder`; `github:minglu6/dsh-provider-qoder` remains an alternative source. To link a local checkout after building:
 
 ```sh
 npm install
@@ -27,16 +27,18 @@ dsh plugin --profile web link /absolute/path/to/dsh-provider-qoder
 
 Restart the Web profile after installing or rebuilding the plugin's browser bundle.
 
+For Desktop, fully quit the application and replace `--profile web` with `--profile desktop`. When migrating this implementation from an older GitHub/tarball install named `dsh-provider-qoder`, replace that dependency and its `dsh.profile.bundles` entry with the scoped name; also update the existing `llm-qoder` entry's package `name` to `@lightmanlu/dsh-provider-qoder`. Preserve that entry's connection configuration, credential references, and all credential storage. Do not load both names at once.
+
 Remove:
 
 ```sh
-dsh plugin --profile web remove dsh-provider-qoder
+dsh plugin --profile web remove @lightmanlu/dsh-provider-qoder
 ```
 
 From a DeepSeek Harness checkout:
 
 ```sh
-pnpm dsh plugin --profile web add github:minglu6/dsh-provider-qoder
+pnpm dsh plugin --profile web add @lightmanlu/dsh-provider-qoder
 pnpm dsh web
 ```
 
@@ -67,6 +69,15 @@ In-band upstream errors expose the nested provider message and gateway request I
 The adapter incrementally recognizes `<thinking>`, `<think>`, `<reasoning>`, and `<thought>` across stream boundaries, even if upstream emits them with reasoning disabled. Ordinary text, whitespace, native reasoning, and structured tool calls are preserved.
 
 A normal stop containing only reasoning, or unclosed tagged reasoning without a structured tool call, finishes with `QODER_INCOMPLETE_RESPONSE` rather than reporting success. Partial reasoning remains available as evidence; orphan DSML fragments are not converted into invented tool calls. Real tool calls and length-limit termination retain their normal behavior. This guard does not retry requests or replay tools.
+
+### Remote sessions and unsolicited checkpoints
+
+Remote session identity is scoped to the gateway, account, provider route, model, harness `sessionId`, and request `purpose`. Compaction and session-title calls do not share the foreground conversation's remote session. Requests without a harness session get a fresh identity; request-record IDs also include the serialized messages, tools, prompt, and generation settings.
+
+For ordinary conversations, the adapter quarantines the specific unsolicited `<analysis>…</analysis><summary>…</summary>` checkpoint scaffold containing at least three recognized English/Chinese checkpoint headings. Fragmented tags and Markdown quote separators are supported; ordinary XML examples and answers following a checkpoint are preserved. Quarantined output is not exposed as answer text, and generation is retried **once** with the original history/tools, a fresh remote session, and an instruction to complete the task. The adapter never executes or replays tools. Another checkpoint finishes with `QODER_UNEXPECTED_SUMMARY`, not a successful stop; upstream failures and cancellation retain their original semantics.
+
+Harness requests explicitly marked `purpose: 'compaction'` or `'session-title'`, and user-requested summaries, bypass this output safeguard. DSH compaction can carry the foreground tool declarations, so tool presence is not used to identify it. The guard is not a general XML filter or a fix for the gateway's internal summarization behavior. Recovery may incur one additional model request.
+
 
 ## Development
 

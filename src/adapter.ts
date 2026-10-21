@@ -40,6 +40,7 @@ import { exchangeJobToken, fetchUserInfo, refreshJobToken, type QoderJobTokenSes
 import { serializeMessages, transformTools, lastUserText } from './serialize.ts'
 import { parseQoderSse, DONE, parseEnvelope } from './sse.ts'
 import { translate } from './translate.ts'
+import { recoverCheckpoint } from './response-guard.ts'
 
 /** One catalog model entry advertised by the adapter. */
 export interface QoderCatalogModel {
@@ -380,13 +381,14 @@ export class QoderAdapter extends LlmAdapter {
       ? consumer.signal
       : AbortSignal.any([options.signal, consumer.signal])
     using watchdog = idleWatchdog(upstream, connection.streamIdleTimeoutMs, STREAM_IDLE_TIMEOUT_CODE)
-    const iterator = this.request(
+    const iterator = recoverCheckpoint(recovery => this.request(
       options,
       watchdog.signal,
       connection,
       rawPat,
       () => { watchdog.pulse() },
-    )[Symbol.asyncIterator]()
+      recovery,
+    ), options)[Symbol.asyncIterator]()
     let exhausted = false
     try {
       while (true) {
@@ -414,7 +416,7 @@ export class QoderAdapter extends LlmAdapter {
       consumer.abort('Qoder CN stream consumer stopped')
       if (!exhausted && iterator.return !== undefined) {
         try {
-          await iterator.return()
+          await iterator.return(undefined)
         } catch (_abortedTransportTeardown) {
           // The consumer controller already owns termination.
         }
@@ -428,15 +430,18 @@ export class QoderAdapter extends LlmAdapter {
     connection: QoderConnectionOptions,
     rawPat: string,
     onComment: () => void,
+    recovery = false,
   ): AsyncIterable<StreamChunk> {
-    // Loop-invariant request facts: model, serialized messages, record id.
+    // Auth retries keep these facts; a recovery generation gets a fresh remote session.
     const qoderModel = options.model
     const attachments = this.config.resolveAttachments()
     const messages = await serializeMessages(options, attachments)
     const tools = transformTools(options)
-    const system = options.system ?? ''
+    const system = (options.system ?? '') + (recovery
+      ? '\n\nThis is not a compaction request. Complete the latest user task using the supplied conversation and existing tool results. Return an answer or a structured tool call, not an internal conversation checkpoint. Do not repeat completed tool actions.'
+      : '')
     const originalContent = lastUserText(options.messages)
-    const recordID = stableChatRecordID(qoderModel, options)
+    const sessionScope = recovery ? crypto.randomUUID() : options.sessionId ?? crypto.randomUUID()
     const maxTokens = options.maxTokens ?? connection.maxTokens
     const reasoningEnabled = options.reasoningEffort !== undefined && options.reasoningEffort !== 'off'
     const chatURL = qoderChatUrl(connection.endpoints)
@@ -465,8 +470,15 @@ export class QoderAdapter extends LlmAdapter {
       const requestId = crypto.randomUUID()
       const sessionID = crypto
         .createHash('sha256')
-        .update(`qoder-session\0${identity.userID}\0${qoderModel}`)
+        .update(JSON.stringify([
+          'qoder-session', connection.endpoints.gateway, identity.userID, options.provider,
+          qoderModel, sessionScope, options.purpose ?? 'conversation',
+        ]))
         .digest('hex').slice(0, 16)
+      const recordID = crypto.createHash('sha256').update(JSON.stringify({
+        sessionID, model: qoderModel, messages, tools, system, maxTokens,
+        reasoningEffort: options.reasoningEffort,
+      })).digest('hex').slice(0, 16)
 
       const reqBody: Record<string, unknown> = {
         request_id: requestId,
@@ -678,35 +690,6 @@ export class QoderAdapter extends LlmAdapter {
     identityCache.set(key, resolved)
     return resolved
   }
-}
-
-/** Stable chat-record id for one request (session continuity on the gateway). */
-function stableChatRecordID(model: string, options: GenerateOptions): string {
-  const hash = crypto.createHash('sha256')
-  hash.update('qoder-record')
-  hash.update('\0')
-  hash.update(model)
-  for (const msg of options.messages) {
-    hash.update('\0')
-    hash.update(msg.role)
-    if (msg.role === 'tool') hash.update(msg.toolCallId)
-    for (const block of msg.content) {
-      hash.update('\0')
-      hash.update(block.type)
-      if (block.type === 'text' || block.type === 'reasoning') hash.update(block.text)
-      if (block.type === 'tool-call') {
-        hash.update(block.name)
-        hash.update(block.arguments)
-      }
-    }
-  }
-  if (options.system !== undefined) {
-    hash.update('\0')
-    hash.update(options.system)
-  }
-  hash.update('\0')
-  hash.update(`mt=${options.maxTokens ?? 'default'}`)
-  return hash.digest('hex').slice(0, 16)
 }
 
 /** Decode envelope payload strings into envelope objects, pulsing transport activity. */
